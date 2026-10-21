@@ -1,0 +1,8 @@
+node_modules/
+dist/
+.dsh-checkpoint/
+*.log
+.DS_Store
+
+*.tgz
+.pnpm-store/

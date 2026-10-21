@@ -1,0 +1,12 @@
+{
+  "auto_draft_on_milestone": true,
+  "ignore_patterns": [
+    "node_modules",
+    ".venv",
+    "dist",
+    "build",
+    ".dsh-checkpoint",
+    ".git"
+  ],
+  "max_draft_count": 10
+}

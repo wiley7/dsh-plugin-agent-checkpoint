@@ -1,0 +1,54 @@
+{
+  "name": "dsh-plugin-agent-checkpoint",
+  "version": "0.1.0",
+  "description": "Session-aware checkpoint manager for DeepSeek Harness (DSH). Pairs git file snapshots with serialized agent conversation context.",
+  "type": "module",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "bin": {
+    "dsh-plugin-agent-checkpoint": "./dist/index.js"
+  },
+  "files": [
+    "dist",
+    "cordis.patch.yml",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "build": "tsc -p tsconfig.build.json",
+    "watch": "tsc -p tsconfig.build.json --watch",
+    "start": "node dist/index.js",
+    "typecheck": "tsc -p tsconfig.test.json --noEmit",
+    "pretest": "pnpm run build && tsc -p tsconfig.test.json",
+    "test": "node --test dist/__tests__/*.test.js",
+    "prepublishOnly": "pnpm run build"
+  },
+  "keywords": [
+    "dsh",
+    "deepseek-harness",
+    "mcp",
+    "checkpoint",
+    "git",
+    "session-aware",
+    "agent"
+  ],
+  "author": "icyleaf",
+  "license": "MIT",
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.30.0",
+    "zod": "^3.23.8"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.0",
+    "typescript": "^5.7.0"
+  },
+  "engines": {
+    "node": ">=20.0.0",
+    "dsh": ">=0.2.0-rc.2"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  }
+}

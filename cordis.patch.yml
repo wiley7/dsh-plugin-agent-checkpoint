@@ -1,0 +1,41 @@
+# dsh-plugin-agent-checkpoint bundle patch
+#
+# Mounts the plugin's MCP stdio server into the profile composition through
+# `@deepseek-ai/dsh-mcp-client`. Because this package declares
+# `dsh.bundle.patch`, `dsh plugin --profile <name> add link:<path>` installs it
+# and appends it to `dsh.profile.bundles` automatically, which applies this
+# patch the next time the profile boots.
+#
+# The default workspace is the directory DSH was launched from. Pin a specific
+# project by overriding the entry in the profile's own `cordis.patch.yml`
+# (patch overrides replace the whole `config` object):
+#
+#   - id: agent-checkpoint
+#     config:
+#       transport: stdio
+#       serverName: agent-checkpoint
+#       command: node
+#       args:
+#         - !!js decodeURIComponent(new URL('node_modules/dsh-plugin-agent-checkpoint/dist/index.js', baseUrl).pathname)
+#         - '--workspace'
+#         - /absolute/path/to/project
+#       cwd: /absolute/path/to/project
+#       toolCallTimeoutMs: 120000
+#       failOnStartupError: true
+#
+# `baseUrl` is the profile directory, so the first argument resolves to the
+# installed copy of the server inside the profile's node_modules.
+- insert:
+    - id: agent-checkpoint
+      name: '@deepseek-ai/dsh-mcp-client'
+      config:
+        transport: stdio
+        serverName: agent-checkpoint
+        command: node
+        args:
+          - !!js decodeURIComponent(new URL('node_modules/dsh-plugin-agent-checkpoint/dist/index.js', baseUrl).pathname)
+          - '--workspace'
+          - !!js process.env.DSH_AGENT_CHECKPOINT_WORKSPACE ?? process.cwd()
+        cwd: !!js process.env.DSH_AGENT_CHECKPOINT_WORKSPACE ?? process.cwd()
+        toolCallTimeoutMs: 120000
+        failOnStartupError: false
