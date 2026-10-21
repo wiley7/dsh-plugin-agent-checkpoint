@@ -90,6 +90,13 @@ describe('mcp server', () => {
       assert.equal(byName.get('rollback_checkpoint')?.annotations?.destructiveHint, true, 'rollback must be destructive');
       assert.equal(byName.get('get_status')?.annotations?.readOnlyHint, true, 'get_status is read-only');
       assert.equal(byName.get('list_checkpoints')?.annotations?.readOnlyHint, true, 'list_checkpoints is read-only');
+      // Every tool can be pointed at another project without restarting the server.
+      for (const tool of listed.tools) {
+        const properties = (tool.inputSchema as { properties?: Record<string, unknown> }).properties ?? {};
+        assert.ok('workspace' in properties, `${tool.name} must accept an optional workspace argument`);
+      }
+      const required = (byName.get('get_status')?.inputSchema as { required?: string[] }).required ?? [];
+      assert.ok(!required.includes('workspace'), 'workspace stays optional');
     } finally {
       await session.close();
     }

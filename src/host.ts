@@ -15,6 +15,7 @@
 import type { IncomingMessage, ServerResponse } from 'node:http';
 import { realpath } from 'node:fs/promises';
 import { isAbsolute, resolve as resolvePath } from 'node:path';
+import { CheckpointError, CheckpointService } from './checkpoint.js';
 import { currentBranch, git, headHash, isDirty, isInsideWorkTree } from './git.js';
 import { discoverSessionLog, readSessionHeader, resolveDshHome } from './session.js';
 import { listRecords } from './store.js';
@@ -26,6 +27,8 @@ export const name = 'agent-checkpoint';
 export const inject = [ 'webServer' ];
 /** Exact route the browser half polls. */
 export const ROUTE_PATH = '/api/agent-checkpoint/git';
+/** Exact route that initialises a project so the badge has something to show. */
+export const INIT_ROUTE_PATH = '/api/agent-checkpoint/init';
 /** Commits returned when the caller does not ask for a specific window. */
 export const DEFAULT_MAX_COMMITS = 120;
 /** Upper bound for `?limit=`, so one request cannot read a whole monorepo history. */
@@ -389,6 +392,122 @@ export async function handleGitRequest(
   sendJson(res, 200, snapshot);
 }
 
+/** The JSON body of one {@link INIT_ROUTE_PATH} response. */
+export interface InitResponse {
+  ok: boolean;
+  /** Absolute project that was initialised. */
+  workspace: string;
+  source: WorkspaceSource;
+  sessionId: string | null;
+  /** True when this call created the repository. */
+  created: boolean;
+  gitVersion: string | null;
+  branch: string | null;
+  head: string | null;
+  gitignoreUpdated: boolean;
+  excludeUpdated: boolean;
+  storePath: string;
+  configPath: string;
+  configFound: boolean;
+  nextSteps: string[];
+  warnings: string[];
+  initializedAt: string;
+  error?: string;
+  message?: string;
+}
+
+/**
+ * Serve one `POST /api/agent-checkpoint/init` request.
+ *
+ * Enabling checkpoints writes `.gitignore`, `.git/info/exclude` and the
+ * `.dsh-checkpoint/` store, and may run `git init`, so it is a two-step action:
+ * the browser half only issues this request after the operator's second click,
+ * and the route itself refuses to act without `?confirm=1`. Loopback-only, POST
+ * only — a stray link or a refreshed page cannot trigger it.
+ * @param req - incoming loopback request.
+ * @param res - response owned by this handler.
+ * @param config - host half configuration.
+ */
+export async function handleInitRequest(
+  req: IncomingMessage,
+  res: ServerResponse,
+  config: AgentCheckpointHostConfig = {},
+): Promise<void> {
+  if (!isLoopbackAddress(req.socket?.remoteAddress)) {
+    sendJson(res, 403, { ok: false, error: 'forbidden', message: 'agent-checkpoint only answers loopback requests' });
+    return;
+  }
+  const method = (req.method ?? 'GET').toUpperCase();
+  if (method !== 'POST') {
+    res.setHeader('allow', 'POST');
+    sendJson(res, 405, { ok: false, error: 'method_not_allowed' });
+    return;
+  }
+
+  let url: URL;
+  try {
+    url = new URL(req.url ?? INIT_ROUTE_PATH, 'http://localhost');
+  } catch {
+    sendJson(res, 400, { ok: false, error: 'invalid_request_target' });
+    return;
+  }
+
+  const confirm = (queryParam(url, 'confirm') ?? '').toLowerCase();
+  if (confirm !== '1' && confirm !== 'true') {
+    sendJson(res, 400, {
+      ok: false,
+      error: 'confirmation_required',
+      message:
+        'enabling checkpoints writes .gitignore, .git/info/exclude and the .dsh-checkpoint store, and may create a repository; repeat the request with confirm=1 after the operator approves',
+    });
+    return;
+  }
+
+  const resolution = await resolveWorkspace({
+    workspace: queryParam(url, 'workspace'),
+    sessionId: queryParam(url, 'session'),
+    config,
+  });
+
+  try {
+    const service = new CheckpointService(resolution.workspace);
+    const result = await service.initWorkspace(resolution.workspace);
+    const body: InitResponse = {
+      ok: true,
+      workspace: result.workspace,
+      source: resolution.source,
+      sessionId: resolution.sessionId,
+      created: result.created,
+      gitVersion: result.gitVersion,
+      branch: result.branch,
+      head: result.head,
+      gitignoreUpdated: result.gitignoreUpdated,
+      excludeUpdated: result.excludeUpdated,
+      storePath: result.storePath,
+      configPath: result.configPath,
+      configFound: result.configFound,
+      nextSteps: result.nextSteps,
+      warnings: [ ...resolution.warnings, ...result.warnings ],
+      initializedAt: new Date().toISOString(),
+    };
+    sendJson(res, 200, body);
+  } catch (error) {
+    const code = error instanceof CheckpointError ? error.code : 'init_failed';
+    const message = error instanceof Error ? error.message : String(error);
+    // `workspace_not_repository_root` means the folder lives inside another
+    // repository: conflating that with a plain failure would hide the fix.
+    sendJson(res, code === 'workspace_not_repository_root' ? 409 : 400, {
+      ok: false,
+      error: code,
+      message,
+      workspace: resolution.workspace,
+      source: resolution.source,
+      sessionId: resolution.sessionId,
+      warnings: resolution.warnings,
+    });
+  }
+}
+
 /**
  * Cordis plugin body: register the badge route.
  *
@@ -397,12 +516,23 @@ export async function handleGitRequest(
  */
 export function apply(ctx: PluginContextLike, rawConfig: unknown = {}): void {
   const config = normalizeHostConfig(rawConfig);
-  const register = () =>
-    ctx.webServer.register({
-      kind: 'exact',
-      path: ROUTE_PATH,
-      handler: (req, res) => handleGitRequest(req, res, config),
-    });
-  if (typeof ctx.effect === 'function') ctx.effect(register, 'agent-checkpoint: git badge route');
+  const register = () => {
+    const disposers = [
+      ctx.webServer.register({
+        kind: 'exact',
+        path: ROUTE_PATH,
+        handler: (req, res) => handleGitRequest(req, res, config),
+      }),
+      ctx.webServer.register({
+        kind: 'exact',
+        path: INIT_ROUTE_PATH,
+        handler: (req, res) => handleInitRequest(req, res, config),
+      }),
+    ];
+    return () => {
+      for (const dispose of disposers) dispose();
+    };
+  };
+  if (typeof ctx.effect === 'function') ctx.effect(register, 'agent-checkpoint: git badge routes');
   else register();
 }

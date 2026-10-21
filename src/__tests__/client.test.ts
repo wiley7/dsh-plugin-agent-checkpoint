@@ -77,13 +77,15 @@ interface Bundle {
   id: string;
   exports: Record<string, any>;
   fetches: string[];
+  requests: Array<{ url: string; method: string }>;
 }
 
 /** Load the browser bundle inside a vm sandbox. */
-async function loadBundle(options: { state?: unknown; response?: unknown } = {}): Promise<Bundle> {
+async function loadBundle(options: { state?: unknown; response?: unknown; initResponse?: { status: number; body: unknown } } = {}): Promise<Bundle> {
   const code = await readFile(BUNDLE, 'utf8');
   const meta: { id?: string; factory?: (require: (id: string) => unknown) => unknown } = {};
   const fetches: string[] = [];
+  const requests: Array<{ url: string; method: string }> = [];
   const sandbox: Record<string, unknown> = {
     window: {
       __ModuleLoader__: {
@@ -112,8 +114,17 @@ async function loadBundle(options: { state?: unknown; response?: unknown } = {})
     decodeURIComponent,
     URLSearchParams,
     Symbol,
-    fetch: async (url: string) => {
+    fetch: async (url: string, init?: { method?: string }) => {
+      const method = (init?.method ?? 'GET').toUpperCase();
       fetches.push(url);
+      requests.push({ url, method });
+      const isInit = url.includes('/agent-checkpoint/init');
+      if (isInit && method === 'POST' && options.initResponse !== undefined) {
+        return { ok: false, status: options.initResponse.status, json: async () => options.initResponse!.body };
+      }
+      if (isInit && method === 'POST') {
+        return { ok: true, status: 200, json: async () => options.initResponse?.body ?? { ok: true, workspace: '/tmp/plain' } };
+      }
       return { ok: true, status: 200, json: async () => options.response ?? SNAPSHOT };
     },
   };
@@ -125,7 +136,7 @@ async function loadBundle(options: { state?: unknown; response?: unknown } = {})
     if (id === 'react') return react;
     throw new Error(`unexpected require("${id}") in the client bundle`);
   });
-  return { id: String(meta.id), exports, fetches };
+  return { id: String(meta.id), exports, fetches, requests };
 }
 
 describe('client bundle contract', () => {
@@ -223,7 +234,7 @@ describe('client display model', () => {
   });
 
   it('renders branch, short hash, dirty marker and checkpoint flag', async () => {
-    const bundle = await loadBundle({ state: SNAPSHOT });
+    const bundle = await loadBundle({ state: { snapshot: SNAPSHOT, body: SNAPSHOT } });
     const element = bundle.exports.CommitBadge({
       sessionId: 'session-abc',
       t: (key: string) => key,
@@ -237,6 +248,53 @@ describe('client display model', () => {
     assert.ok(texts.some((text) => text.includes('a1b2c3d')), 'short hash should render');
     assert.ok(texts.some((text) => text.includes('*')), 'dirty marker should render');
     assert.ok(texts.some((text) => text.includes('⚑')), 'checkpoint flag should render');
+  });
+});
+
+describe('client init control', () => {
+  /** Route body for a project that has no repository yet. */
+  const NO_REPO = { ok: false, workspace: '/tmp/plain', source: 'session', sessionId: 'session-abc', isRepo: false, branch: null, head: null, isDirty: false, commits: [], capturedAt: '2026-10-21T11:22:44.000Z', error: 'not_a_git_repo', warnings: [] };
+
+  it('offers to initialise a project that is not a repository yet', async () => {
+    const bundle = await loadBundle();
+    const view = bundle.exports.describeWorkspace(NO_REPO);
+    assert.equal(view.kind, 'init');
+    assert.equal(view.workspace, '/tmp/plain');
+    assert.equal(bundle.exports.describeWorkspace(SNAPSHOT).kind, 'commit');
+    assert.equal(bundle.exports.describeWorkspace(null).kind, 'none');
+  });
+
+  it('never offers to initialise a directory DSH merely fell back to', async () => {
+    const bundle = await loadBundle();
+    // `source: 'cwd'` means the session log named no project: that directory is
+    // DSH's own launch folder, and writing into it would be a surprise.
+    assert.equal(bundle.exports.describeWorkspace({ ...NO_REPO, source: 'cwd' }).kind, 'none');
+    assert.equal(bundle.exports.describeWorkspace({ ok: false, error: 'invalid_workspace', source: 'session', workspace: '/tmp/x' }).kind, 'none');
+    assert.equal(bundle.exports.describeWorkspace({ ...NO_REPO, workspace: '' }).kind, 'none');
+  });
+
+  it('posts the confirmation flag and refreshes once the project is ready', async () => {
+    const bundle = await loadBundle({ response: NO_REPO });
+    const store = bundle.exports.createStore();
+    await store.refresh('session-abc');
+    assert.equal(store.peek('session-abc'), null);
+
+    // The second click: one POST that the host half only acts on with confirm=1.
+    assert.equal(bundle.exports.initUrl('session-abc'), '/api/agent-checkpoint/init?session=session-abc&confirm=1');
+
+    const ok = await store.initialize('session-abc');
+    assert.equal(ok.ok, true);
+    const posts = bundle.fetches.filter((url: string) => url.includes('/init'));
+    assert.deepEqual(posts, [ '/api/agent-checkpoint/init?session=session-abc&confirm=1' ]);
+    assert.equal(bundle.requests.some((request) => request.method === 'POST'), true);
+  });
+
+  it('surfaces a refused initialisation as an error and keeps the badge empty', async () => {
+    const bundle = await loadBundle({ response: NO_REPO, initResponse: { status: 409, body: { ok: false, error: 'workspace_not_repository_root', message: 'this folder lives inside another repository' } } });
+    const store = bundle.exports.createStore();
+    await assert.rejects(() => store.initialize('session-abc'), /lives inside another repository/);
+    assert.equal(store.error('session-abc'), 'this folder lives inside another repository');
+    assert.equal(store.peek('session-abc'), null);
   });
 });
 

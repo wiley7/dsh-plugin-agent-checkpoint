@@ -19,12 +19,14 @@ import { zstdCompressSync } from 'node:zlib';
 import { runGit } from '../git.js';
 import {
   DEFAULT_MAX_COMMITS,
+  INIT_ROUTE_PATH,
   MAX_COMMITS_LIMIT,
   ROUTE_PATH,
   apply,
   buildGitSnapshot,
   checkpointIndex,
   handleGitRequest,
+  handleInitRequest,
   isLoopbackAddress,
   normalizeHostConfig,
   parseMaxCommits,
@@ -352,7 +354,7 @@ describe('handleGitRequest', () => {
     assert.equal((body.commits as unknown[]).length, 1);
   });
 
-  it('registers one exact route through ctx.effect', () => {
+  it('registers both exact routes through ctx.effect', () => {
     const registrations: Array<{ kind: string; path: string; handler?: unknown }> = [];
     let effects = 0;
     let disposed = 0;
@@ -372,9 +374,101 @@ describe('handleGitRequest', () => {
     };
     apply(ctx as never, { workspace: workspace.dir });
     assert.equal(effects, 1);
-    assert.equal(registrations.length, 1);
-    assert.equal(registrations[0]?.kind, 'exact');
-    assert.equal(registrations[0]?.path, ROUTE_PATH);
+    assert.deepEqual(registrations.map((route) => route.path), [ ROUTE_PATH, INIT_ROUTE_PATH ]);
+    assert.ok(registrations.every((route) => route.kind === 'exact'));
     assert.equal(disposed, 0);
+  });
+});
+
+describe('handleInitRequest', () => {
+  it('refuses peers that are not on the loopback interface', async () => {
+    const { res, recorded } = fakeResponse();
+    await handleInitRequest(fakeRequest({ method: 'POST', remoteAddress: '10.1.2.3', url: `${INIT_ROUTE_PATH}?confirm=1` }), res);
+    assert.equal(recorded.statusCode, 403);
+    assert.equal(bodyOf(recorded).error, 'forbidden');
+  });
+
+  it('allows only POST, so a link or a page load cannot initialise anything', async () => {
+    const { res, recorded } = fakeResponse();
+    await handleInitRequest(fakeRequest({ method: 'GET', url: `${INIT_ROUTE_PATH}?confirm=1` }), res);
+    assert.equal(recorded.statusCode, 405);
+    assert.equal(recorded.headers.allow, 'POST');
+    assert.equal(bodyOf(recorded).error, 'method_not_allowed');
+  });
+
+  it('refuses to write without the operator confirmation flag', async () => {
+    const workspace = await makeWorkspace('ckpt-host-init-unconfirmed-');
+    try {
+      for (const url of [ INIT_ROUTE_PATH, `${INIT_ROUTE_PATH}?confirm=0`, `${INIT_ROUTE_PATH}?workspace=${encodeURIComponent(workspace.dir)}` ]) {
+        const { res, recorded } = fakeResponse();
+        await handleInitRequest(fakeRequest({ method: 'POST', url }), res);
+        assert.equal(recorded.statusCode, 400, url);
+        assert.equal(bodyOf(recorded).error, 'confirmation_required', url);
+      }
+      // Nothing was created: the refusal precedes every write.
+      await assert.rejects(runGit(workspace.dir, [ 'rev-parse', '--git-dir' ]));
+    } finally {
+      await workspace.cleanup();
+    }
+  });
+
+  it('creates the repository, ignore rules and store for the confirmed project', async () => {
+    const workspace = await makeWorkspace('ckpt-host-init-');
+    try {
+      const { res, recorded } = fakeResponse();
+      await handleInitRequest(
+        fakeRequest({ method: 'POST', url: `${INIT_ROUTE_PATH}?confirm=1&workspace=${encodeURIComponent(workspace.dir)}` }),
+        res,
+      );
+      assert.equal(recorded.statusCode, 200, recorded.body);
+      const body = bodyOf(recorded);
+      assert.equal(body.ok, true);
+      assert.equal(body.created, true);
+      assert.equal(body.source, 'query');
+      assert.equal(body.workspace, await realpath(workspace.dir));
+      assert.equal(body.gitignoreUpdated, true);
+      assert.equal(body.excludeUpdated, true);
+      assert.equal(typeof body.storePath, 'string');
+      // The only warning is the expected one: this call created the repository.
+      assert.deepEqual(
+        (body.warnings as string[]).filter((warning) => !warning.startsWith('initialised a new git repository')),
+        [],
+      );
+
+      // The same project is a repository now, so the badge has something to show.
+      const snapshot = await buildGitSnapshot(workspace.dir);
+      assert.equal(snapshot.isRepo, true);
+      assert.equal(snapshot.branch, 'main');
+
+      const again = fakeResponse();
+      await handleInitRequest(
+        fakeRequest({ method: 'POST', url: `${INIT_ROUTE_PATH}?confirm=1&workspace=${encodeURIComponent(workspace.dir)}` }),
+        again.res,
+      );
+      assert.equal(again.recorded.statusCode, 200);
+      assert.equal(bodyOf(again.recorded).created, false, 'a second call is idempotent');
+    } finally {
+      await workspace.cleanup();
+    }
+  });
+
+  it('initialises the project the viewed session points at', async () => {
+    const workspace = await makeWorkspace('ckpt-host-init-session-');
+    try {
+      await writeSessionLog(workspace.dshHome, 'session-init-viewed', workspace.dir);
+      const { res, recorded } = fakeResponse();
+      await handleInitRequest(
+        fakeRequest({ method: 'POST', url: `${INIT_ROUTE_PATH}?confirm=1&session=session-init-viewed` }),
+        res,
+        { workspace: '/definitely/not/this/repo' },
+      );
+      assert.equal(recorded.statusCode, 200, recorded.body);
+      const body = bodyOf(recorded);
+      assert.equal(body.source, 'session');
+      assert.equal(body.sessionId, 'session-init-viewed');
+      assert.equal(body.workspace, await realpath(workspace.dir));
+    } finally {
+      await workspace.cleanup();
+    }
   });
 });

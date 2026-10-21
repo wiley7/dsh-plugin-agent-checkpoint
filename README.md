@@ -189,6 +189,7 @@ same-origin route, served by the host half:
 | Workspace | `?workspace=` takes precedence, otherwise the **cwd of the session you are viewing** (read from its `session.v*.jsonl` header), then the entry config, `$DSH_WORKSPACE`, cwd |
 | History | up to `limit` (default 50, max 500) recent commits, each annotated with the checkpoint that produced it |
 | Writes | none — the route never commits, resets or stages; destructive work stays behind the MCP tools' confirmation tokens |
+| Init route | `POST /api/agent-checkpoint/init?session=<sessionId>&confirm=1` — enables checkpoints for the viewed project (see below) |
 | Polling | 20 s per mounted badge, paused while the tab is hidden; one request is shared by every badge of the same session, and snapshots are memoized for 8 s |
 
 The route is read-only on purpose: a UI that could move `HEAD` would make the
@@ -199,9 +200,35 @@ indicator, not a per-message provenance record. Attributing each reply to the
 commit that was current when it was written needs the per-turn timeline that the
 route already returns; that is a roadmap item, not a promise.
 
-Entering a workspace that is not a git repository simply hides the badge (the
-route answers `{ ok: false, error: "not_a_git_repo" }` once, and the client
-stops polling a "show nothing" state).
+### Enabling checkpoints from the UI
+
+A project that is not a git repository yet has nothing to show, so the badge
+turns into a dashed `⚙ Enable checkpoints` control instead of disappearing:
+
+1. **First click** arms the control — nothing is written. It turns into an amber
+   `Confirm setup` button plus a `✕` cancel, so a stray click cannot initialise
+   anything.
+2. **Second click** posts `POST /api/agent-checkpoint/init?session=<id>&confirm=1`.
+   The host half refuses the same request without `confirm=1`, answers `POST`
+   only, and only to loopback peers.
+3. The host half then runs the same `init_workspace` path the MCP tool uses:
+   `git init --initial-branch=main` when needed, append the plugin's `.gitignore`
+   defaults, write the managed block in `.git/info/exclude`, create the
+   `.dsh-checkpoint/` store. When it returns, the control re-fetches and becomes
+   the normal commit pill — no page reload.
+
+| Aspect | Behavior |
+| --- | --- |
+| Route | `POST /api/agent-checkpoint/init?session=<sessionId>&confirm=1` |
+| Guard | loopback only; `POST` only (`405` otherwise); `confirm=1` required, otherwise `400 confirmation_required` and **no write happens** |
+| Target | the cwd of the session you are viewing, or `?workspace=`; the control is only offered when the workspace came from the session (`source: "session"`), never for the cwd DSH merely fell back to |
+| Response | `{ ok, workspace, created, gitVersion, branch, head, gitignoreUpdated, excludeUpdated, storePath, configPath, warnings, nextSteps }` |
+| Failures | `409 workspace_not_repository_root` when the folder lives inside another repository (initialise that one instead); other `CheckpointError` codes come back as `400` |
+| Idempotent | a second call on a prepared project answers `created: false` and changes nothing |
+
+A plain folder that resolved through the `cwd` fallback (DSH's own launch
+directory, or a session whose log names no project) shows nothing at all: the
+plugin never offers to run `git init` in a directory the user did not point at.
 
 ### Badge configuration
 
@@ -238,16 +265,21 @@ discovers the session log from `$DSH_HOME` and `$DSH_SESSION_ID` itself.
 All nine tools follow the requirement document. Tools marked **destructive**
 require a two-phase confirmation (see [Safety rails](#safety-rails)).
 
+Every tool also accepts an optional `workspace` argument (absolute path of the
+project to operate on), so one stdio server can snapshot or roll back several
+projects without a restart; it defaults to the workspace the server started
+with (`--workspace`, `$DSH_WORKSPACE` or its cwd).
+
 | Tool | Arguments | Returns |
 | --- | --- | --- |
-| `init_workspace` | `workspace_path?` | repository state, whether it was created, ignore rules applied, next steps |
-| `create_draft_checkpoint` | `title`, `tags[]?`, `remark?` | `draft_id`, changed files, diff summary, context summary |
-| `preview_checkpoint` | `checkpoint_id`, `include_diff?`, `max_diff_chars?` | title, remark, tags, timestamps, file diff, context digest, bound commit hash (empty for drafts) |
-| `confirm_checkpoint` **(destructive)** | `draft_id`, `commit_message`, `confirmation_id?` | first call: confirmation token + summary; second call: commit hash, confirmed checkpoint id |
-| `list_checkpoints` | `tags_filter[]?`, `limit?`, `include_drafts?`, `query?` | newest-first checkpoint list |
-| `rollback_checkpoint` **(destructive)** | `checkpoint_id`, `confirmation_id?` | first call: confirmation token + summary; second call: restored files, branch moved flag, context digest |
-| `create_branch` | `branch_name`, `checkpoint_id?` | branch name, start point |
-| `switch_branch` | `branch_name` | previous and current branch |
+| `init_workspace` | `workspace_path?`, `workspace?` | repository state, whether it was created, ignore rules applied, next steps |
+| `create_draft_checkpoint` | `title`, `tags[]?`, `remark?`, `workspace?` | `draft_id`, changed files, diff summary, context summary |
+| `preview_checkpoint` | `checkpoint_id`, `include_diff?`, `max_diff_chars?`, `workspace?` | title, remark, tags, timestamps, file diff, context digest, bound commit hash (empty for drafts) |
+| `confirm_checkpoint` **(destructive)** | `draft_id`, `commit_message`, `confirmation_id?`, `workspace?` | first call: confirmation token + summary; second call: commit hash, confirmed checkpoint id |
+| `list_checkpoints` | `tags_filter[]?`, `limit?`, `include_drafts?`, `query?`, `workspace?` | newest-first checkpoint list |
+| `rollback_checkpoint` **(destructive)** | `checkpoint_id`, `confirmation_id?`, `workspace?` | first call: confirmation token + summary; second call: restored files, branch moved flag, context digest |
+| `create_branch` | `branch_name`, `checkpoint_id?`, `workspace?` | branch name, start point |
+| `switch_branch` | `branch_name`, `workspace?` | previous and current branch |
 | `get_status` | — | working-tree changes, current branch, draft/confirmed counts, last checkpoint, pending confirmations |
 
 Checkpoint ids are stable, human-readable strings such as
@@ -435,15 +467,15 @@ config loader, the session-log reader (including zstd compressed fixtures), the
 MCP transport itself (it spawns `dist/index.js` and talks to it as a client),
 the loopback route (workspace resolution, timeline, loopback/method fences) and
 the browser bundle (loaded in a `node:vm` sandbox with a React shim, so the slot
-wiring and the display model are exercised without a DOM). 63 tests, no network
-access, no writes outside the OS temp dir.
+wiring, the display model and the init control are exercised without a DOM).
+73 tests, no network access, no writes outside the OS temp dir.
 
 Layout:
 
 ```
 src/index.ts      MCP stdio server (nine tools)
 src/checkpoint.ts service: drafts, confirmation, rollback
-src/host.ts       web host half: loopback git route
+src/host.ts       web host half: loopback git + init routes
 src/session.ts    DSH session-log discovery and digest
 src/git.ts        system git wrapper
 src/store.ts      .dsh-checkpoint storage and confirmation tokens

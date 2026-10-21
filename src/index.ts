@@ -22,7 +22,7 @@ import { CheckpointError, CheckpointService } from './checkpoint.js';
 import type { CheckpointRecord, PendingConfirmation } from './types.js';
 
 /** Server version, kept in sync with package.json. */
-const VERSION = '0.1.0';
+const VERSION = '0.2.0';
 
 /** MCP server name; the DSH client prefixes tools with it. */
 const SERVER_NAME = 'agent-checkpoint';
@@ -143,9 +143,43 @@ function escapeCell(value: string): string {
   return value.replace(/\|/g, '\\|').replace(/\n/g, ' ');
 }
 
+/**
+ * Resolve the project one tool call should operate on.
+ *
+ * Tools are bound to the workspace the server started with, but a session can
+ * legitimately talk about several projects, so every tool also accepts an
+ * explicit `workspace` argument. Accepting it as a path (not a repository id)
+ * keeps the tools usable from a single stdio server.
+ * @param base - workspace from `--workspace` / `$DSH_WORKSPACE` / cwd.
+ * @param override - the call's optional `workspace` argument.
+ * @returns absolute path of the project to operate on.
+ */
+export function resolveToolWorkspace(base: string, override?: string | null): string {
+  const candidate = override === undefined || override === null || override.trim() === '' ? base : override;
+  return path.resolve(candidate);
+}
+
+/** Description reused by every tool's optional `workspace` argument. */
+const WORKSPACE_ARG_DESCRIPTION =
+  'Project directory to operate on, as an absolute path. Defaults to the workspace this server was started with; pass it to snapshot or roll back another project without restarting the server.';
+
 /** Build and configure the MCP server. */
 export function buildServer(options: CliOptions): McpServer {
-  const service = new CheckpointService(path.resolve(options.workspace));
+  const baseWorkspace = path.resolve(options.workspace);
+  /** One service per resolved project: the store and git handles are per-repo. */
+  const services = new Map<string, CheckpointService>();
+  /**
+   * @param workspace - optional per-call project override.
+   * @returns the service bound to that project, reusing the cached instance.
+   */
+  const serviceFor = (workspace?: string | null): CheckpointService => {
+    const resolved = resolveToolWorkspace(baseWorkspace, workspace);
+    const existing = services.get(resolved);
+    if (existing !== undefined) return existing;
+    const created = new CheckpointService(resolved);
+    services.set(resolved, created);
+    return created;
+  };
   const server = new McpServer(
     { name: SERVER_NAME, version: VERSION },
     {
@@ -167,6 +201,7 @@ export function buildServer(options: CliOptions): McpServer {
       description:
         'Create a git repository (when missing) for the workspace and install the plugin .gitignore defaults plus the ignore rules used by drafts. Idempotent and safe to call at the start of every session.',
       inputSchema: {
+        workspace: z.string().optional().describe(WORKSPACE_ARG_DESCRIPTION),
         workspace_path: z
           .string()
           .optional()
@@ -174,7 +209,8 @@ export function buildServer(options: CliOptions): McpServer {
       },
       annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: false },
     },
-    async ({ workspace_path }) => {
+    async ({ workspace_path, workspace }) => {
+      const service = serviceFor(workspace_path ?? workspace);
       try {
         const result = await service.initWorkspace(workspace_path ?? service.workspace);
         const markdown = [
@@ -205,13 +241,15 @@ export function buildServer(options: CliOptions): McpServer {
       description:
         'Capture a milestone draft: the current working-tree state as a git tree object plus a serialized snapshot of the DSH agent context (task plan, recent messages, tool usage). Creates no commit and does not move HEAD.',
       inputSchema: {
+        workspace: z.string().optional().describe(WORKSPACE_ARG_DESCRIPTION),
         title: z.string().min(1).max(200).describe('Short human-readable title for the checkpoint.'),
         tags: z.array(z.string().min(1).max(40)).max(20).optional().describe('Free-form tags used by list_checkpoints filtering.'),
         remark: z.string().max(2000).optional().describe('Optional note explaining why this milestone matters.'),
       },
       annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: false },
     },
-    async ({ title, tags, remark }) => {
+    async ({ title, tags, remark, workspace }) => {
+      const service = serviceFor(workspace);
       try {
         const result = await service.createDraft({
           title,
@@ -257,13 +295,15 @@ export function buildServer(options: CliOptions): McpServer {
       description:
         'Show one checkpoint in full: title, remark, tags, timestamps, file diffs, the serialized agent-context digest and the bound commit hash (empty for drafts). Read-only.',
       inputSchema: {
+        workspace: z.string().optional().describe(WORKSPACE_ARG_DESCRIPTION),
         checkpoint_id: z.string().min(2).describe('Checkpoint id, or a unique fragment of it.'),
         include_diff: z.boolean().optional().describe('Include the unified diff in the response (default true).'),
         max_diff_chars: z.number().int().min(1000).max(200_000).optional().describe('Cap the diff body length (default 12000).'),
       },
       annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
     },
-    async ({ checkpoint_id, include_diff, max_diff_chars }) => {
+    async ({ checkpoint_id, include_diff, max_diff_chars, workspace }) => {
+      const service = serviceFor(workspace);
       try {
         const result = await service.previewCheckpoint({
           checkpointId: checkpoint_id,
@@ -326,6 +366,7 @@ export function buildServer(options: CliOptions): McpServer {
       description:
         'HIGH RISK. Commit a draft checkpoint as a real git commit. Without confirmation_id this call only returns a single-use confirmation token and does nothing else: show the operator the summary, and repeat the call with the token only after they explicitly approve. Refuses when HEAD moved or the working tree drifted since the draft.',
       inputSchema: {
+        workspace: z.string().optional().describe(WORKSPACE_ARG_DESCRIPTION),
         draft_id: z.string().min(2).describe('Draft checkpoint id (or a unique fragment).'),
         commit_message: z.string().min(1).max(2000).describe('Commit message for the resulting commit.'),
         confirmation_id: z
@@ -335,7 +376,8 @@ export function buildServer(options: CliOptions): McpServer {
       },
       annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: false, openWorldHint: false },
     },
-    async ({ draft_id, commit_message, confirmation_id }) => {
+    async ({ draft_id, commit_message, confirmation_id, workspace }) => {
+      const service = serviceFor(workspace);
       try {
         const result = await service.confirmCheckpoint({
           draftId: draft_id,
@@ -372,6 +414,7 @@ export function buildServer(options: CliOptions): McpServer {
       description:
         'List checkpoints newest-first, optionally filtered by tags and free-text query. Read-only.',
       inputSchema: {
+        workspace: z.string().optional().describe(WORKSPACE_ARG_DESCRIPTION),
         tags_filter: z.array(z.string().min(1).max(40)).optional().describe('Only return checkpoints carrying ALL of these tags.'),
         limit: z.number().int().min(1).max(200).optional().describe('Maximum entries to return (default 20).'),
         include_drafts: z.boolean().optional().describe('Include draft (uncommitted) checkpoints (default true).'),
@@ -379,7 +422,8 @@ export function buildServer(options: CliOptions): McpServer {
       },
       annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
     },
-    async ({ tags_filter, limit, include_drafts, query }) => {
+    async ({ tags_filter, limit, include_drafts, query, workspace }) => {
+      const service = serviceFor(workspace);
       try {
         const result = await service.listCheckpoints({
           tagsFilter: tags_filter,
@@ -420,6 +464,7 @@ export function buildServer(options: CliOptions): McpServer {
       description:
         'HIGH RISK. Restore working-tree files to a checkpoint and return the captured agent context so the session can continue from that point. Without confirmation_id this call only returns a single-use token. Aborts with a conflict list when the working tree has uncommitted changes.',
       inputSchema: {
+        workspace: z.string().optional().describe(WORKSPACE_ARG_DESCRIPTION),
         checkpoint_id: z.string().min(2).describe('Checkpoint id (or a unique fragment).'),
         confirmation_id: z
           .string()
@@ -428,7 +473,8 @@ export function buildServer(options: CliOptions): McpServer {
       },
       annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: false, openWorldHint: false },
     },
-    async ({ checkpoint_id, confirmation_id }) => {
+    async ({ checkpoint_id, confirmation_id, workspace }) => {
+      const service = serviceFor(workspace);
       try {
         const result = await service.rollbackCheckpoint({ checkpointId: checkpoint_id, confirmationId: confirmation_id });
         if (result.status === 'confirmation_required') {
@@ -470,12 +516,14 @@ export function buildServer(options: CliOptions): McpServer {
       title: 'Create branch',
       description: 'Create a local branch at a checkpoint commit (or at HEAD when checkpoint_id is omitted). Does not switch branches. Local only: no remotes are touched.',
       inputSchema: {
+        workspace: z.string().optional().describe(WORKSPACE_ARG_DESCRIPTION),
         branch_name: z.string().min(1).max(100).describe('New branch name (validated with git check-ref-format).'),
         checkpoint_id: z.string().min(2).optional().describe('Checkpoint to branch from. Defaults to HEAD.'),
       },
       annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: false },
     },
-    async ({ branch_name, checkpoint_id }) => {
+    async ({ branch_name, checkpoint_id, workspace }) => {
+      const service = serviceFor(workspace);
       try {
         const result = await service.createBranch({ branchName: branch_name, checkpointId: checkpoint_id });
         const markdown = [
@@ -500,11 +548,13 @@ export function buildServer(options: CliOptions): McpServer {
       title: 'Switch branch',
       description: 'Check out an existing local branch. Fails instead of forcing when the working tree has conflicting changes.',
       inputSchema: {
+        workspace: z.string().optional().describe(WORKSPACE_ARG_DESCRIPTION),
         branch_name: z.string().min(1).max(100).describe('Existing local branch to check out.'),
       },
       annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: false },
     },
-    async ({ branch_name }) => {
+    async ({ branch_name, workspace }) => {
+      const service = serviceFor(workspace);
       try {
         const result = await service.switchBranch({ branchName: branch_name });
         const markdown = [
@@ -527,10 +577,13 @@ export function buildServer(options: CliOptions): McpServer {
       title: 'Get workspace status',
       description:
         'Report the working-tree diff status, current branch, recent commit, snapshot store contents (drafts/confirmed), effective policy and the newest checkpoint. Read-only.',
-      inputSchema: {},
+      inputSchema: {
+        workspace: z.string().optional().describe(WORKSPACE_ARG_DESCRIPTION),
+      },
       annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
     },
-    async () => {
+    async ({ workspace }) => {
+      const service = serviceFor(workspace);
       try {
         const result = await service.getStatus();
         const markdown = [
