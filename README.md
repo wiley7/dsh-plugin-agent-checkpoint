@@ -1,94 +1,198 @@
 # dsh-plugin-agent-checkpoint
 
-Session-aware task checkpoints for [DeepSeek Harness (DSH)](https://github.com/deepseek-ai/deepseek-harness).
+**Session-aware task checkpoints for [DeepSeek Harness (DSH)](https://github.com/deepseek-ai/deepseek-harness).**
+Go back to a milestone and both halves come back: the files *and* the agent
+context that produced them.
 
-Most agent checkpoint tools snapshot **files**. That is only half of what a
-coding session is: when you go back to an earlier milestone, the files come
-back but the conversation — the plan, the decisions, the tool results that
-justified the code — is gone, so the agent restarts from a blank slate.
+|  |  |
+| --- | --- |
+| **What it is** | an MCP server (nine tools) plus a small browser badge, installed as one DSH plugin bundle |
+| **What a checkpoint holds** | the exact working tree (as a git tree object) **and** a digest of the DSH session — plan, recent messages, tool usage |
+| **File storage** | native `git` CLI, in your own repository; the plugin invents no new file format |
+| **Context storage** | JSON sidecars under `.dsh-checkpoint/` in the workspace |
+| **Destructive operations** | always two-phase: a human-confirmed, single-use token is required |
+| **Network** | none. Local only, no telemetry, no push/pull/fetch |
+| **Requires** | Node.js ≥ 20, `git` ≥ 2.23 (recommended), a DSH build with `@deepseek-ai/dsh-mcp-client` |
 
-`dsh-plugin-agent-checkpoint` binds both halves together:
-
-- **files** — the exact working-tree state, addressed by a git tree object and
-  (after confirmation) by a real commit hash;
-- **agent context** — a serialized digest of the DSH session that produced that
-  state: the task plan, the recent user/assistant messages and tool usage.
-
-Rolling back restores the files *and* hands the agent a context digest so it
-can continue from the milestone instead of re-discovering the task.
-
-It ships as an MCP stdio server with nine tools, uses the system `git` binary
-(no bundled git library), and never performs a destructive git operation
-without a human-confirmed, single-use token.
-
-It also ships a browser half: every finalized reply in the DSH web UI carries a
-small badge with the commit the workspace is currently on
-(`main 4e850e7`, `*` for uncommitted changes, `⚑` when that commit is a
-confirmed checkpoint).
+Contents: [The problem](#the-problem) · [Feature tour](#feature-tour) ·
+[How it works](#how-it-works) · [Quick start](#quick-start) ·
+[Using it in a session](#using-it-in-a-session) · [The commit badge](#the-commit-badge-in-the-web-ui) ·
+[Tool reference](#tool-reference) · [Configuration](#configuration) · [Storage](#storage-layout) ·
+[Safety model](#safety-model) · [Rollback](#rollback-semantics) ·
+[Context capture](#agent-context-capture) · [Errors](#error-reference) ·
+[Development](#development) · [Limitations](#limitations-and-roadmap)
 
 ---
 
-## Requirements
+## The problem
 
-| Requirement | Version | Notes |
-| --- | --- | --- |
-| Node.js | ≥ 20 | developed on Node 26; the session reader prefers `node:zlib` zstd support and falls back to the `zstd` CLI |
-| git | ≥ 2.23 recommended | `git switch` is used when available, `git checkout` otherwise |
-| DSH | any build with `@deepseek-ai/dsh-mcp-client` | the commit badge additionally needs a web profile (the desktop or `web` app) |
+A coding session is not just a pile of files. It is files **plus** a direction:
+the plan the agent is following, the decisions it just made, the command output
+that justified them.
 
-`git` must be installed and on `PATH`; the plugin never installs it for you.
+Snapshot tools that only copy files lose the second half. Roll back to “before
+the refactor” and the files return, but the conversation has moved on — the agent
+starts the milestone from a blank slate and re-discovers what it already knew.
 
-## Install
+`dsh-plugin-agent-checkpoint` treats the pair as one unit:
+
+```
+checkpoint = { git tree of the working directory } + { digest of the DSH session }
+                    ↑                                        ↑
+          restored by git                     handed back to the agent in the tool
+          (files, exactly as they were)       result, and kept on disk as a sidecar
+```
+
+## Feature tour
+
+### 1. Draft snapshots that never touch your branch
+
+`create_draft_checkpoint` captures the whole working tree into a git tree object
+and a **dangling commit**, anchored under `refs/dsh-checkpoint/drafts/<id>` so
+garbage collection cannot prune it. `HEAD` never moves, nothing is staged in your
+real index, and `git status` looks exactly as it did a moment before.
+
+Each draft records the changed files with their status, a diff (inline, or a
+`.patch` sidecar when huge), a byte-capped context digest, the workspace, the
+branch, the base commit, and an id such as `draft-1792582824171-fb62938a`.
+
+### 2. Preview before you commit to it
+
+`preview_checkpoint` shows one checkpoint in full — title, remark, tags,
+timestamps, file list, unified diff, context digest (plan progress, last user
+request, tools used) and the bound commit hash (empty for drafts).
+`list_checkpoints` gives the newest-first index, filterable by tags, by free-text
+query, or restricted to confirmed snapshots.
+
+### 3. Confirmation turns a draft into a real commit
+
+`confirm_checkpoint` is the only code path in the plugin that commits:
+
+```
+git add --all
+git commit --no-verify -m "<message>"
+```
+
+The commit hash is written back into the checkpoint record, the draft is retired,
+and its `draft-…` id keeps resolving to the confirmed record. If the working tree
+or `HEAD` drifted since the draft was taken, the confirm is **refused** with a
+conflict report instead of quietly committing a mixture.
+
+### 4. Rollback restores files *and* re-hands the context to the agent
+
+`rollback_checkpoint` first refuses to run on a dirty working tree — uncommitted
+work is never discarded. On a clean tree it restores a confirmed checkpoint with
+`git reset --hard <commit>`, or a draft with `git read-tree --reset -u` (files
+only; the branch does not move, because a draft was never a commit). The result
+carries the stored context digest and the restored plan, and tells the agent to
+treat it as authoritative and to re-read files from disk.
+
+### 5. Branch off a checkpoint instead of losing work
+
+`create_branch` starts a branch at a checkpoint commit (or at `HEAD`) so an
+alternative can be explored without disturbing the current one; `switch_branch`
+moves between them. Both are plain local git operations with validation —
+nothing is pushed anywhere.
+
+### 6. The commit badge — and enabling checkpoints from the UI
+
+Every finalized reply in the DSH web UI gets a quiet pill showing the workspace
+HEAD (`⎇ main 4e850e7`), a `*` when the tree is dirty, and a `⚑` when that commit
+is a confirmed checkpoint. In a project that is not a git repository yet, the pill
+becomes a dashed **⚙ Enable checkpoints** control that initialises the project —
+behind a second click and a server-side `confirm=1` check.
+[Details below.](#the-commit-badge-in-the-web-ui)
+
+### Why not just `git stash` / `git commit` / tags?
+
+| Plain git | This plugin |
+| --- | --- |
+| You must remember to commit, or stash and forget | Drafts are cheap, anchored, and never disturb `HEAD` |
+| A stash has no plan, no conversation, no rationale | Each draft carries a session digest: plan, recent messages, tool usage |
+| Restoring files leaves the agent amnesiac | Rollback returns the context digest into the agent's context window |
+| `git reset --hard` discards uncommitted work | Rollback refuses on a dirty tree and reports the files instead |
+| Committing is one keystroke away for an agent | Committing needs a payload-bound, single-use token the operator approved |
+| Nothing links git history to “which milestone” | Confirmed checkpoints annotate the history the badge reads |
+
+## How it works
+
+One npm package, two halves, mounted by a profile bundle patch (`cordis.patch.yml`):
+
+```
+                        ┌──────────────────────────────┐
+  Agent ──────────────▶ │  MCP stdio server            │
+  (nine tools)          │  dist/index.js               │
+                        └───────┬──────────┬───────────┘
+                                │          │
+                     ┌──────────┘          └───────────┐
+                     ▼                                 ▼
+            system git CLI                    .dsh-checkpoint/
+            (trees, commits,                  (records, context
+             refs, branches)                   sidecars, tokens)
+                     ▲                                 ▲
+                     │                                 │
+  Browser badge ─────┴──── host plugin  ◀──────────────┘
+  (client.js)              dist/host.js
+        │                        │
+        └── GET /api/agent-checkpoint/git ──────┐
+            POST /api/agent-checkpoint/init ────┘
+
+  DSH session log (read-only) ──▶ context capture ──▶ .dsh-checkpoint/contexts/
+```
+
+- **The MCP server owns writes.** Nine tools, spawned over stdio by
+  `@deepseek-ai/dsh-mcp-client`, exposed to the agent as
+  `mcp__agent-checkpoint__<tool>`.
+- **The host plugin owns two loopback routes.** The browser cannot run git, so
+  the badge asks the host half; the git route never commits, stages or resets,
+  and both routes are loopback-only.
+- **The browser half is a slot registration**, not a separate app: a
+  `__ModuleLoader__` bundle that renders into
+  `conversation.chat.assistant-actions`.
+
+## Quick start
 
 ```bash
-git clone <this repository> dsh-plugin-agent-checkpoint
+git clone git@github.com:wiley7/dsh-plugin-agent-checkpoint.git
 cd dsh-plugin-agent-checkpoint
 pnpm install
-pnpm run build          # emits dist/
+pnpm run build                 # emits dist/ (host half + MCP server)
+node dist/index.js --help      # sanity check the server half
 ```
 
-Verify the server starts:
+`git` must already be on `PATH`; the plugin never installs or bundles it.
 
-```bash
-node dist/index.js --help
-```
+### Register with DSH
 
-## Register with DSH
-
-The package has two halves and `cordis.patch.yml` mounts both:
-
-| Half | Composited entry | What it does |
+| Half | Composited entry | What it contributes |
 | --- | --- | --- |
-| **MCP server** | `agent-checkpoint-mcp` → `@deepseek-ai/dsh-mcp-client` | the nine tools, spawned over stdio |
-| **host plugin** | `agent-checkpoint` → `dsh-plugin-agent-checkpoint` | one loopback JSON route the browser badge reads |
+| MCP server | `agent-checkpoint-mcp` → `@deepseek-ai/dsh-mcp-client` | the nine tools, spawned over stdio |
+| Host plugin | `agent-checkpoint` → `dsh-plugin-agent-checkpoint` | the loopback routes the badge reads |
 
-A profile composes plugin *bundles*, and its user layer can only patch entries
-that already exist, so installing this package as a bundle is the intended path.
-
-### Option A — install as a bundle (recommended)
+**Option A — install as a bundle (recommended).** A profile's user layer can only
+patch entries that already exist, so a bundle is the supported path:
 
 ```bash
 dsh plugin --profile web add link:/absolute/path/to/dsh-plugin-agent-checkpoint
+# or, once published:  add dsh-plugin-agent-checkpoint
 ```
 
-(`add dsh-plugin-agent-checkpoint` instead, once it is published to npm.)
-
-The package declares `dsh.bundle.patch`, so DSH appends it to
+The package declares `dsh.bundle.patch`, so DSH records it in
 `dsh.profile.bundles` and applies `cordis.patch.yml` on the next boot. Restart
-DSH: the tools appear as `mcp__agent-checkpoint__<tool>` and the badge appears
-under every finalized assistant reply.
+DSH: the tools appear as `mcp__agent-checkpoint__*` and the badge appears under
+every finalized assistant reply.
 
-The workspace is resolved per request (see the badge section below); the MCP
-server falls back to `$DSH_AGENT_CHECKPOINT_WORKSPACE`, then `$DSH_WORKSPACE`,
-then the directory DSH was launched from. To pin both halves, export it before
-launching:
+Workspace resolution, highest priority first: an explicit tool argument →
+`?workspace=` on the route → the **cwd of the session being viewed** (read from
+its log header) → the entry config → `$DSH_AGENT_CHECKPOINT_WORKSPACE` →
+`$DSH_WORKSPACE` → the directory DSH was launched from. To pin both halves:
 
 ```bash
 export DSH_AGENT_CHECKPOINT_WORKSPACE=/absolute/path/to/your/project
 ```
 
-or override the entries in the profile's own `cordis.patch.yml` (an override
-*replaces* the whole `config` object, so repeat every key you need):
+Or override the entries in the profile's own `cordis.patch.yml` — note that an
+override **replaces** the whole `config` object, so repeat every key:
 
 ```yaml
 - id: agent-checkpoint
@@ -110,13 +214,10 @@ or override the entries in the profile's own `cordis.patch.yml` (an override
 ```
 
 `baseUrl` inside `!!js` is the profile directory, so the first argument resolves
-to the installed copy of the MCP server.
+to the installed copy of the server.
 
-### Option B — insert the entries by hand
-
-If you prefer not to install the package into the profile, append one `insert`
-block with both entries to the profile's `cordis.patch.yml` (for the desktop
-profile: `~/.dsh/profiles/desktop/cordis.patch.yml`):
+**Option B — insert the entries by hand** (without installing the package into
+the profile):
 
 ```yaml
 - insert:
@@ -139,112 +240,181 @@ profile: `~/.dsh/profiles/desktop/cordis.patch.yml`):
         failOnStartupError: true
 ```
 
-A bare `- id: …` entry at the top level of that file does **not** work: patch
-entries without `insert:` only override entries that already exist. Drop the
-host entry if you only want the tools and no badge — the MCP half works on its
-own (including in `headless` profiles, where no web server exists).
+A bare `- id: …` entry at the top level does **not** work: entries without
+`insert:` only override entries that already exist. Drop the host entry if you
+want the tools without the badge — the MCP half works on its own, including in
+`headless` profiles where no web server exists.
 
-### Verifying the registration
-
-```bash
-dsh --profile web --dump-config | grep -A 12 agent-checkpoint
-```
-
-The composed entry list should contain both rows. If the MCP server fails to
-start, DSH reports the spawn error at boot; run the server manually
-(`node dist/index.js --workspace <project>`) to see its own diagnostics. For the
-badge, open a conversation in the same profile and check the action strip under
-any finished reply, or call the route directly:
+### Verify the registration
 
 ```bash
+dsh --profile web --dump-config | grep -A 12 agent-checkpoint   # both entries present
 curl -s 'http://127.0.0.1:<port>/api/agent-checkpoint/git' | head -c 400
 ```
 
-## Commit badge in the web UI
+If the MCP server fails to start, DSH reports the spawn error at boot; run it by
+hand (`node dist/index.js --workspace <project>`) to read its own diagnostics.
 
-Every finalized assistant message gets one quiet pill in its action strip:
+## Using it in a session
+
+A milestone looks like this. The operator (or the agent, at a milestone boundary)
+takes a draft; the operator reviews it; confirming produces a real commit.
+
+```
+init_workspace                                  # once per project
+  └─ create_draft_checkpoint "login flow done"  # cheap, does not commit
+       └─ preview_checkpoint <draft-id>         # operator reviews diff + context
+            └─ confirm_checkpoint <draft-id> "feat: login flow"   # needs a token
+                 └─ … next milestone …
+                      └─ rollback_checkpoint <ckpt-id>            # needs a token
+```
+
+Two-phase confirmation, seen from the agent's side:
+
+```jsonc
+// 1st call — never destructive; it mints a token and returns a summary
+{"draft_id": "draft-1792582824171-fb62938a", "commit_message": "feat: login flow"}
+// → isError: true, status: "confirmation_required",
+//   confirmation_id: "cfm-4f0c…", summary: "…", details: {…}, expires_at: "…"
+
+// 2nd call — the same payload plus the token the operator approved
+{"draft_id": "draft-1792582824171-fb62938a", "commit_message": "feat: login flow",
+ "confirmation_id": "cfm-4f0c…"}
+// → isError: false, status: "confirmed", commit_hash: "4e850e71be0a…",
+//   checkpoint_id: "ckpt-1792582824171-9b2c9d71"
+```
+
+The token is bound to the exact payload by SHA-256: changing the draft id or the
+message invalidates it (`confirmation_mismatch`), it expires after
+`confirmation_ttl_seconds` (default 600 s), and it is consumed on use.
+
+Every tool also accepts an optional absolute `workspace` argument, so one stdio
+server can snapshot, roll back and branch several projects without a restart.
+
+## The commit badge in the web UI
 
 ```
 ⎇ main 4e850e7 *    ⚑
 ```
 
-- `4e850e7` — short hash of the workspace HEAD; **click copies the full hash**,
+- `4e850e7` — short hash of the workspace HEAD; **click copies the full hash**;
   the tooltip carries branch, subject, commit time, checkpoint id and workspace.
-- `*` — the workspace has uncommitted changes (so the badge never claims the
-  files match the commit when they do not).
-- `⚑` — that commit is a **confirmed checkpoint**; hover for its title. This is
-  the visual link between the git history and the plugin's snapshot library.
-
-### Where the numbers come from
-
-The browser cannot read a repository, so the badge calls the plugin's own
-same-origin route, served by the host half:
-
-| Aspect | Behavior |
-| --- | --- |
-| Route | `GET /api/agent-checkpoint/git?session=<sessionId>&limit=<n>` |
-| Access | loopback only (`127.0.0.0/8`, `::1`, `::ffff:` forms); anything else gets `403` |
-| Methods | `GET` and `HEAD` only; `405` otherwise |
-| Response | `{ ok, workspace, source, isRepo, branch, head, isDirty, commits[], capturedAt, error, warnings }` with `cache-control: no-store` |
-| Workspace | `?workspace=` takes precedence, otherwise the **cwd of the session you are viewing** (read from its `session.v*.jsonl` header), then the entry config, `$DSH_WORKSPACE`, cwd |
-| History | up to `limit` (default 50, max 500) recent commits, each annotated with the checkpoint that produced it |
-| Writes | none — the route never commits, resets or stages; destructive work stays behind the MCP tools' confirmation tokens |
-| Init route | `POST /api/agent-checkpoint/init?session=<sessionId>&confirm=1` — enables checkpoints for the viewed project (see below) |
-| Polling | 20 s per mounted badge, paused while the tab is hidden; one request is shared by every badge of the same session, and snapshots are memoized for 8 s |
-
-The route is read-only on purpose: a UI that could move `HEAD` would make the
-"no destructive operation without confirmation" guarantee meaningless.
-
-The badge shows the workspace HEAD as of the last poll — it is a *current*
-indicator, not a per-message provenance record. Attributing each reply to the
-commit that was current when it was written needs the per-turn timeline that the
-route already returns; that is a roadmap item, not a promise.
+- `*` — the working tree has uncommitted changes, so the badge never implies the
+  files match that commit.
+- `⚑` — that commit is a **confirmed checkpoint**; hover for its title.
 
 ### Enabling checkpoints from the UI
 
-A project that is not a git repository yet has nothing to show, so the badge
-turns into a dashed `⚙ Enable checkpoints` control instead of disappearing:
+In a project that is not a git repository yet, the pill becomes a dashed
+**⚙ Enable checkpoints** control instead of disappearing:
 
-1. **First click** arms the control — nothing is written. It turns into an amber
-   `Confirm setup` button plus a `✕` cancel, so a stray click cannot initialise
-   anything.
+1. **First click arms it** — nothing is written; it becomes an amber
+   `Confirm setup` button plus a `✕` cancel, so a stray click initialises nothing.
 2. **Second click** posts `POST /api/agent-checkpoint/init?session=<id>&confirm=1`.
-   The host half refuses the same request without `confirm=1`, answers `POST`
-   only, and only to loopback peers.
-3. The host half then runs the same `init_workspace` path the MCP tool uses:
-   `git init --initial-branch=main` when needed, append the plugin's `.gitignore`
-   defaults, write the managed block in `.git/info/exclude`, create the
-   `.dsh-checkpoint/` store. When it returns, the control re-fetches and becomes
-   the normal commit pill — no page reload.
+3. The host half runs the same path as `init_workspace`: `git init
+   --initial-branch=main` when needed, `.gitignore` defaults appended, the managed
+   block written to `.git/info/exclude`, the `.dsh-checkpoint/` store created. The
+   control then re-fetches and becomes the normal commit pill — no reload.
 
-| Aspect | Behavior |
-| --- | --- |
-| Route | `POST /api/agent-checkpoint/init?session=<sessionId>&confirm=1` |
-| Guard | loopback only; `POST` only (`405` otherwise); `confirm=1` required, otherwise `400 confirmation_required` and **no write happens** |
-| Target | the cwd of the session you are viewing, or `?workspace=`; the control is only offered when the workspace came from the session (`source: "session"`), never for the cwd DSH merely fell back to |
-| Response | `{ ok, workspace, created, gitVersion, branch, head, gitignoreUpdated, excludeUpdated, storePath, configPath, warnings, nextSteps }` |
-| Failures | `409 workspace_not_repository_root` when the folder lives inside another repository (initialise that one instead); other `CheckpointError` codes come back as `400` |
-| Idempotent | a second call on a prepared project answers `created: false` and changes nothing |
+The control is only offered when the workspace came from the session being viewed
+(`source: "session"`); for the `cwd` fallback DSH merely launched from, nothing is
+shown — the plugin never offers to `git init` a directory the user did not point
+at. A folder that lives inside another repository answers
+`409 workspace_not_repository_root` and is left untouched.
 
-A plain folder that resolved through the `cwd` fallback (DSH's own launch
-directory, or a session whose log names no project) shows nothing at all: the
-plugin never offers to run `git init` in a directory the user did not point at.
+### Route reference
 
-### Badge configuration
-
-| Key | Default | Meaning |
+| Aspect | `GET /api/agent-checkpoint/git` | `POST /api/agent-checkpoint/init` |
 | --- | --- | --- |
-| `workspace` | auto-detected | fallback workspace when a request carries no `?session=` |
-| `maxCommits` | `120` | server-side cap on the returned history; the badge asks for 50, requests clamp to 500 |
+| Purpose | read the badge snapshot | enable checkpoints for a project |
+| Access | loopback only (`127.0.0.0/8`, `::1`, `::ffff:` forms); else `403` | same |
+| Methods | `GET`, `HEAD`; else `405` | `POST`; else `405` |
+| Guard | none | `confirm=1` required, else `400 confirmation_required` and **no write** |
+| Response | `{ ok, workspace, source, isRepo, branch, head, isDirty, commits[], capturedAt, error, warnings }` | `{ ok, workspace, created, gitVersion, branch, head, gitignoreUpdated, excludeUpdated, storePath, configPath, warnings, nextSteps }` |
+| Caching | `cache-control: no-store` | same |
+| Writes | none — never commits, stages or resets | working tree and `.git` (init, ignore rules, store) |
+| Errors | `not_a_git_repo`, `invalid_workspace` | `confirmation_required`, `workspace_not_repository_root` (409) |
 
-The browser half has no configuration: it is registered into the
+`GET` also accepts `?workspace=<path>` and `?limit=<n>`; the badge polls every
+20 s (paused while the tab is hidden), shares one request per session, and
+memoizes snapshots for 8 s. The route is read-only on purpose: a UI that could
+move `HEAD` would make the “no destructive operation without confirmation”
+guarantee meaningless.
+
+The badge reports the *current* HEAD, not the commit that existed when each reply
+was written. Per-reply attribution needs the per-turn timeline the route already
+returns; it is a roadmap item, not a promise.
+
+Badge configuration (entry config of the host half): `workspace` (fallback when a
+request carries no `?session=`) and `maxCommits` (default `120`; requests clamp at
+`500`). The browser half itself has no configuration — it registers into the
 `conversation.chat.assistant-actions` list slot with id `agent-checkpoint-commit`
-and order `60`, so it coexists with the built-in feedback buttons instead of
+and order `60`, so it coexists with the built-in feedback buttons rather than
 competing for the single `turnTail` chain slot.
 
-## CLI options
+## Tool reference
 
-`node dist/index.js` runs the MCP server half (normally spawned by DSH; useful
+All nine tools are exposed as `mcp__agent-checkpoint__<name>`. Every one accepts
+an optional `workspace` (absolute path of the project) in addition to the
+arguments below. **Destructive** tools require the two-phase confirmation
+described above.
+
+### `init_workspace`
+Prepares a project: checks git, initialises a repository when needed, appends the
+plugin's `.gitignore` defaults, writes the managed `.git/info/exclude` block,
+creates the store, and returns repository state plus next steps.
+Arguments: `workspace_path?`. Idempotent.
+
+### `create_draft_checkpoint`
+Captures files **and** agent context without committing. Returns `draft_id`,
+`files`, `diff_stat`, `diff`, `context_summary`, plus warnings. Refuses with
+`nothing_to_checkpoint` when nothing changed and no context was captured.
+Arguments: `title`, `tags?`, `remark?`.
+
+### `preview_checkpoint`
+Full view of one checkpoint: metadata, file list, diff, context digest, and the
+commit hash it is bound to (`null` for drafts). Arguments: `checkpoint_id` (a
+unique fragment is accepted), `include_diff?` (default `true`), `max_diff_chars?`
+(default 12000, max 200000).
+
+### `confirm_checkpoint` **(destructive)**
+The first call returns a confirmation token and a summary; the second call
+commits and returns `commit_hash` plus the confirmed `checkpoint_id`. Refuses with
+a conflict report when `HEAD` moved or the working tree changed since the draft.
+Arguments: `draft_id`, `commit_message`, `confirmation_id?`.
+
+### `rollback_checkpoint` **(destructive)**
+The first call returns a token and a summary; the second call restores files and
+returns the context digest, the restored plan and rehydration instructions. Aborts
+with `status: "conflict"` when the working tree is dirty.
+Arguments: `checkpoint_id`, `confirmation_id?`.
+
+### `list_checkpoints`
+Newest-first index. Arguments: `tags_filter?` (all listed tags must match),
+`limit?` (default 20, max 200), `include_drafts?` (default `true`), `query?`
+(substring over title, remark, tags and context digest).
+
+### `create_branch` / `switch_branch`
+Local-only branch management. `create_branch` takes `branch_name` (validated with
+`git check-ref-format`) and an optional `checkpoint_id` to start from;
+`switch_branch` takes `branch_name`. `git switch` is used when available and
+`git checkout` otherwise.
+
+### `get_status`
+Read-only report: repository status, branch, `HEAD`, dirty and untracked files,
+draft/confirmed counts, effective policy, newest checkpoint, pending
+confirmations, and hints. Takes no arguments besides `workspace`.
+
+### Checkpoint ids
+
+Stable, human-readable strings such as `draft-1792582824171-fb62938a` and
+`ckpt-1792582824171-9b2c9d71`. Any unique fragment is accepted. After a draft is
+confirmed, its `draft-…` id keeps resolving to the confirmed record through an
+alias.
+
+### CLI options
+
+`node dist/index.js` is the MCP server half (normally spawned by DSH; useful
 standalone for debugging):
 
 ```
@@ -260,65 +430,10 @@ dsh-plugin-agent-checkpoint [options]
 `--session-file` is a testing/automation escape hatch: normally the plugin
 discovers the session log from `$DSH_HOME` and `$DSH_SESSION_ID` itself.
 
-## Tools
-
-All nine tools follow the requirement document. Tools marked **destructive**
-require a two-phase confirmation (see [Safety rails](#safety-rails)).
-
-Every tool also accepts an optional `workspace` argument (absolute path of the
-project to operate on), so one stdio server can snapshot or roll back several
-projects without a restart; it defaults to the workspace the server started
-with (`--workspace`, `$DSH_WORKSPACE` or its cwd).
-
-| Tool | Arguments | Returns |
-| --- | --- | --- |
-| `init_workspace` | `workspace_path?`, `workspace?` | repository state, whether it was created, ignore rules applied, next steps |
-| `create_draft_checkpoint` | `title`, `tags[]?`, `remark?`, `workspace?` | `draft_id`, changed files, diff summary, context summary |
-| `preview_checkpoint` | `checkpoint_id`, `include_diff?`, `max_diff_chars?`, `workspace?` | title, remark, tags, timestamps, file diff, context digest, bound commit hash (empty for drafts) |
-| `confirm_checkpoint` **(destructive)** | `draft_id`, `commit_message`, `confirmation_id?`, `workspace?` | first call: confirmation token + summary; second call: commit hash, confirmed checkpoint id |
-| `list_checkpoints` | `tags_filter[]?`, `limit?`, `include_drafts?`, `query?`, `workspace?` | newest-first checkpoint list |
-| `rollback_checkpoint` **(destructive)** | `checkpoint_id`, `confirmation_id?`, `workspace?` | first call: confirmation token + summary; second call: restored files, branch moved flag, context digest |
-| `create_branch` | `branch_name`, `checkpoint_id?`, `workspace?` | branch name, start point |
-| `switch_branch` | `branch_name`, `workspace?` | previous and current branch |
-| `get_status` | — | working-tree changes, current branch, draft/confirmed counts, last checkpoint, pending confirmations |
-
-Checkpoint ids are stable, human-readable strings such as
-`draft-1792582824171-fb62938a`. Any unique fragment of an id is accepted; after
-a draft is confirmed its original `draft-…` id keeps resolving to the confirmed
-record.
-
-## Typical flow
-
-```
-init_workspace                       # once per workspace
-  └─ create_draft_checkpoint         # at a milestone (subtask finished)
-       └─ preview_checkpoint         # operator reviews files + context
-            └─ confirm_checkpoint    # operator approves → real git commit
-                 └─ … more milestones …
-                      └─ rollback_checkpoint   # go back to any milestone
-```
-
-`create_draft_checkpoint` deliberately **does not commit**. It captures the
-working tree into a tree object, creates a dangling commit object for it and
-anchors that object under `refs/dsh-checkpoint/drafts/<id>` so garbage
-collection cannot prune it while the operator decides. `HEAD` and the branch
-never move.
-
-`confirm_checkpoint` turns a draft into a normal commit:
-
-```
-git add --all
-git commit --no-verify -m "<commit_message>"
-```
-
-and records the resulting hash in the checkpoint store. It refuses (with a
-conflict report, see below) when the repository moved since the draft.
-
 ## Configuration
 
-Optional `checkpoint.config.json` in the workspace root. Missing fields fall
-back to the defaults below; invalid values produce warnings but never abort a
-tool call.
+Optional `checkpoint.config.json` in the workspace root. Missing fields fall back
+to the defaults; invalid values produce warnings but never abort a tool call.
 
 ```json
 {
@@ -332,16 +447,16 @@ tool call.
 | --- | --- | --- |
 | `auto_draft_on_milestone` | `true` | policy hint for the agent: draft at a milestone instead of every turn |
 | `ignore_patterns` | `["node_modules", ".venv", "dist", "build"]` | extra patterns written to `.git/info/exclude`; `.dsh-checkpoint/` is always ignored |
-| `max_draft_count` | `10` | drafts kept per workspace; the oldest draft is dropped when exceeded (confirmed checkpoints are never dropped) |
-| `max_context_message_chars` | `1200` | per-message truncation limit for the context snapshot |
-| `max_context_messages` | `40` | messages kept in a context snapshot |
-| `max_context_bytes` | `524288` | hard cap for one serialized context; oldest messages are dropped first |
-| `max_diff_chars` | `100000` | inline diff cap; longer diffs are stored under `.dsh-checkpoint/diffs/` |
+| `max_draft_count` | `10` | drafts kept per workspace; the oldest is dropped beyond this (confirmed checkpoints are never dropped) |
+| `max_context_message_chars` | `1200` | per-message truncation limit in the context snapshot |
+| `max_context_messages` | `40` | messages kept per context snapshot |
+| `max_context_bytes` | `524288` | hard cap per serialized context; oldest messages are dropped first |
+| `max_diff_chars` | `100000` | inline diff cap; longer diffs go to `.dsh-checkpoint/diffs/` |
 | `confirmation_ttl_seconds` | `600` | lifetime of a confirmation token |
 
-Trigger policy (also from the requirement document): a user command such as
-`/checkpoint` always wins, an agent marking a subtask complete comes second, and
-snapshotting every conversational turn is **off** by default.
+Trigger policy: a user command such as `/checkpoint` always wins, an agent
+marking a subtask complete comes second, and snapshotting every conversational
+turn is **off** by default.
 
 ## Storage layout
 
@@ -351,60 +466,64 @@ snapshotting every conversational turn is **off** by default.
 │   ├── drafts/<id>.json             # draft records
 │   ├── checkpoints/<id>.json        # confirmed records
 │   ├── contexts/<id>.json           # serialized agent context sidecars
-│   ├── diffs/<id>.patch             # full diffs too large to inline
+│   ├── diffs/<id>.patch             # diffs too large to inline
 │   ├── confirmations/<token>.json   # pending single-use tokens
 │   ├── aliases/<draft-id>.json      # draft id → confirmed id
 │   └── tmp-index                    # scratch index, deleted after each draft
 └── .git/                            # file versions live in git, not here
     ├── info/exclude                 # managed ignore block
-    └── refs/dsh-checkpoint/         # anchors that keep draft objects alive
+    └── refs/dsh-checkpoint/         # anchors keeping draft objects alive
 ```
 
-File history is git's job. The plugin only stores what git cannot represent:
-the context sidecars, metadata, and the draft anchors.
+File history is git's job. The plugin stores only what git cannot represent: the
+context sidecars, the metadata, and the anchors that keep draft objects from being
+pruned.
+
+A record carries: `id`, `status` (`draft`/`confirmed`), `title`, `tags`, `remark`,
+timestamps, workspace, branch, `base_commit`, `tree_hash`, `draft_commit`,
+`commit_hash`, `parent_commit`, `files`, `diff_stat`, `diff` (or `diff_path`),
+`context_path`, `context_summary`, `session_id` and `anchor_ref`.
+
+## Safety model
+
+- **Two-phase destructive operations.** `confirm_checkpoint` and
+  `rollback_checkpoint` never act on the first call. They mint a single-use token
+  (`cfm-<hex>`, TTL 600 s) bound to the exact payload via SHA-256, return a
+  human-readable summary, and execute only when called again with that token.
+- **No automatic conflict resolution.** Drifted working tree, moved `HEAD`, dirty
+  rollback target — each returns a conflict list (`status: "conflict"`) with the
+  affected files for the operator to resolve manually.
+- **Uncommitted work is never discarded.** Rollback refuses on a dirty tree.
+- **Drafts never touch `HEAD`.** Capture uses a scratch index
+  (`GIT_INDEX_FILE=.dsh-checkpoint/tmp-index`) plus a dangling commit anchored by
+  a ref, so the branch and the real index are untouched.
+- **Built-in ignore defaults** live in a managed, clearly delimited block inside
+  `.git/info/exclude`; existing user content is preserved.
+- **No deletion of confirmed checkpoints** in this release; only the oldest drafts
+  beyond `max_draft_count` are trimmed.
+- **Loopback-only UI routes**, POST-only initialisation behind `confirm=1`.
+- **Local only.** No network calls, no telemetry, no remote operations. Push,
+  pull, fetch, pull requests and multi-user collaboration are out of scope.
 
 ## Rollback semantics
 
-1. A confirmation token is required (see below).
-2. The working tree must be clean. If it is not, the rollback aborts and
-   returns `status: "conflict"`, `reason: "worktree_dirty"`, the modified and
-   untracked files, and instructions. **Uncommitted work is never discarded.**
+1. A confirmation token is required (see above).
+2. The working tree must be clean. Otherwise the rollback aborts with
+   `status: "conflict"`, `reason: "worktree_dirty"`, the modified and untracked
+   files, and instructions.
 3. Confirmed checkpoint → `git reset --hard <commit>` (the branch moves).
-4. Draft checkpoint → `git read-tree --reset -u <draft commit>` (files are
-   restored, the branch does **not** move, because a draft was never a commit).
-5. The stored context sidecar is attached to the result as a digest: plan
-   progress, the last user request, captured message count and tool usage. The
-   agent is told to treat that digest as the authoritative post-rollback state
-   and to re-read files from disk before assuming their contents.
+4. Draft checkpoint → `git read-tree --reset -u <draft commit>` (files return; the
+   branch does **not** move, because a draft was never a commit).
+5. The stored context sidecar is attached as a digest: plan progress, the last
+   user request, captured message count and tool usage. The agent is told to treat
+   that digest as the authoritative post-rollback state and to re-read files from
+   disk before assuming their contents.
 
-The plugin does not rewrite DSH's live session log
-(`session.v4.jsonl.zstd`). That file is the harness's source of truth and
-rewriting it while DSH has it mapped in memory would corrupt the session.
-Rehydration therefore happens through the tool result, which the agent sees in
-its own context window — plus the sidecar on disk for any later session. This
-limitation is listed in the roadmap.
-
-## Safety rails
-
-- **Two-phase destructive operations.** `confirm_checkpoint` and
-  `rollback_checkpoint` never act on the first call. They mint a single-use
-  token (`cfm-<hex>`, TTL 600s) bound to the exact payload via SHA-256, return
-  a human-readable summary, and only execute when called again with that token.
-  A different draft id or commit message invalidates the token
-  (`confirmation_mismatch`); a reused or expired token is rejected.
-- **No automatic conflict resolution.** Drifted working tree, moved `HEAD`,
-  dirty rollback target — all return a conflict list for the operator to
-  resolve manually.
-- **Built-in ignore defaults.** `.dsh-checkpoint/`, VCS directories and the
-  configured patterns are written to `.git/info/exclude` inside a managed,
-  clearly delimited block; existing user content is preserved.
-- **No deletion of confirmed checkpoints (MVP).** Only draft retention is
-  automated, and only the oldest drafts beyond `max_draft_count`.
-- **Local only.** No network calls, no telemetry, no remote operations. Push,
-  pull, fetch, pull requests and multi-user collaboration are explicitly out of
-  scope.
-- **No blind commits.** The plugin only commits through `confirm_checkpoint`
-  after operator approval; drafts never touch `HEAD`.
+The plugin deliberately does **not** rewrite DSH's live session log
+(`session.v4.jsonl.zstd`). That file is the harness's source of truth; rewriting it
+while DSH has it mapped in memory would corrupt the session. Rehydration happens
+through the tool result (which the agent sees in its own context window) plus the
+sidecar on disk for later sessions.
 
 ## Agent context capture
 
@@ -415,44 +534,49 @@ $DSH_HOME/sessions/<bucket>/session-<id>/session.v4.jsonl.zstd
 ```
 
 Selection order: explicit `--session-file` → `$DSH_SESSION_ID` directory match
-(validated against the log header) → most recent log whose header `cwd` matches
-the workspace. The log is zstd-compressed JSONL; records are parsed defensively
-and unknown shapes are skipped with a warning.
+(validated against the log header) → the most recent log whose header `cwd`
+matches the workspace. The log is zstd-compressed JSONL; records are parsed
+defensively and unknown shapes are skipped with a warning. Decompression prefers
+`node:zlib`'s zstd support and falls back to the `zstd` CLI.
 
 Only meaningful context is kept:
 
 - user messages with `source.kind === "user"` (runtime/time/model-selection
   injections and `<system-reminder>` blocks are dropped);
-- assistant text and the tool names it called;
+- assistant text and the names of the tools it called;
 - the most recent `todo/write` plan;
 - tool call/error counts.
 
 Streaming payloads (`assistant/message` → `data.stream`), base64 blobs and data
-URIs are never stored. Very long messages are truncated; when the payload
-exceeds `max_context_bytes` the oldest messages are dropped first.
+URIs are never stored. Very long messages are truncated; when a payload exceeds
+`max_context_bytes`, the oldest messages are dropped first. A missing session log
+is not an error — the checkpoint still captures files and records a warning.
 
-A missing session log is not an error: the checkpoint still captures files and
-records a warning.
+## Error reference
 
-## Errors and conflicts
-
-Tool failures return `isError: true` with a structured payload instead of
-crashing the server:
+Tool failures return `isError: true` with a structured payload instead of crashing
+the server:
 
 ```json
 { "ok": false, "error": { "code": "checkpoint_not_found", "message": "…", "details": {} } }
 ```
 
 Confirmation challenges and conflicts are also `isError: true`, with
-`status: "confirmation_required"` or `status: "conflict"` at the top level so an
+`status: "confirmation_required"` or `status: "conflict"` at the top level, so an
 agent cannot mistake them for success.
 
-Error codes include `not_a_git_repo`, `nested_repository`,
-`workspace_not_repository_root`, `git_unavailable`, `nothing_to_checkpoint`,
-`checkpoint_not_found`, `checkpoint_incomplete`, `already_confirmed`,
-`invalid_confirmation`, `confirmation_expired`, `confirmation_mismatch`,
-`invalid_branch_name`, `branch_exists`, `branch_not_found`, `no_commits` and
-`switch_failed`.
+| Code | Meaning |
+| --- | --- |
+| `git_unavailable` | no `git` binary on `PATH` |
+| `git_init_failed` | `git init` (or the ignore-rule scaffolding) failed |
+| `not_a_git_repo` / `nested_repository` | workspace is not a repository / lives inside another one |
+| `workspace_not_repository_root` | the target is a subdirectory of a repository |
+| `nothing_to_checkpoint` | no file changes and no context to capture |
+| `checkpoint_not_found` / `checkpoint_incomplete` | unknown id / record missing its tree |
+| `already_confirmed` | the draft was already turned into a commit |
+| `invalid_confirmation` / `confirmation_expired` / `confirmation_mismatch` | token unknown, expired, or bound to a different payload |
+| `invalid_branch_name` / `branch_exists` / `branch_not_found` / `no_commits` / `switch_failed` | branch management failures |
+| `internal_error` | an unexpected failure; the message carries the detail |
 
 ## Development
 
@@ -462,15 +586,13 @@ pnpm run build       # dist/ without tests
 pnpm test            # builds, compiles tests, runs node:test
 ```
 
-The suite covers the service against real temporary git repositories, the
-config loader, the session-log reader (including zstd compressed fixtures), the
-MCP transport itself (it spawns `dist/index.js` and talks to it as a client),
-the loopback route (workspace resolution, timeline, loopback/method fences) and
-the browser bundle (loaded in a `node:vm` sandbox with a React shim, so the slot
-wiring, the display model and the init control are exercised without a DOM).
-73 tests, no network access, no writes outside the OS temp dir.
-
-Layout:
+The suite covers the service against real temporary git repositories, the config
+loader, the session-log reader (including zstd fixtures), the MCP transport itself
+(it spawns `dist/index.js` and talks to it as a client), both loopback routes
+(workspace resolution, timeline, method and loopback fences, the init guard) and
+the browser bundle (loaded in a `node:vm` sandbox with a React shim, so slot wiring,
+the display model and the init control are exercised without a DOM).
+**73 tests, no network access, no writes outside the OS temp dir.**
 
 ```
 src/index.ts      MCP stdio server (nine tools)
@@ -482,38 +604,34 @@ src/store.ts      .dsh-checkpoint storage and confirmation tokens
 client/client.js  browser half: commit badge (no build step)
 ```
 
-## Risks and maintenance surface
+## Limitations and roadmap
 
-- **DSH session schema drift.** `session.v4` is a DSH implementation detail. If
-  DSH bumps the version or reshapes records, context capture degrades (warnings,
-  empty context) rather than corrupting checkpoints; the reader must then be
-  updated. This is the plugin's deliberate maintenance surface.
-- **Draft staleness.** A draft captures a tree, not a promise. If files change
-  or `HEAD` moves before confirmation, the confirm is refused; create a new
-  draft.
-- **Large sessions.** Byte caps keep sidecars small; the trade-off is that very
-  long conversations lose their oldest messages.
-- **Git version differences.** `git switch` requires 2.23+; the plugin falls
-  back to `git checkout`. Nothing else depends on a recent git.
-- **Repository identity.** If the repository has no `user.name`/`user.email`
-  configured, the plugin writes a repository-local placeholder identity so
-  commits do not fail; set a real identity for real commits.
+| Area | Today | Next |
+| --- | --- | --- |
+| Destructive ops | two-phase token | same, plus approving from the badge |
+| Context rehydration | tool result digest + sidecar | survive a DSH restart by re-reading sidecars into a fresh session |
+| Badge | current `HEAD` per reply | per-reply attribution from the per-turn timeline the route already returns |
+| Branching | local create/switch | store export/backup, timeline UI, cross-workspace index |
+| Out of scope | push/pull/fetch, remotes, collaboration, automatic conflict resolution, binary large-object handling, background scheduling, checkpoint deletion | — |
+
+Known maintenance surfaces:
+
+- **DSH session schema drift.** `session.v4` is a DSH implementation detail. If DSH
+  bumps the version or reshapes records, context capture degrades to warnings
+  (never to corrupted checkpoints) and the reader must be updated. This is the
+  plugin's deliberate maintenance surface.
+- **Draft staleness.** A draft captures a tree, not a promise. If files change or
+  `HEAD` moves before confirmation, the confirm is refused — take a new draft.
+- **Repository identity.** Without `user.name`/`user.email`, the plugin writes a
+  repository-local placeholder identity so commits do not fail; set a real identity
+  for real commits.
 - **Client bundle contract.** `client/client.js` targets the DSH web slot API
   (`conversation.chat.assistant-actions`, `ctx.slots`/`ctx.locale`) and the
-  `__ModuleLoader__` bundle shape. If DSH changes either, the badge disappears
-  from the UI while the tools keep working; the host route and the display model
-  stay independently testable, which is why they are split from the slot wiring.
-- **Badge semantics.** The badge reports the current workspace HEAD, not the
-  commit that existed when each reply was written; a dirty marker prevents it
-  from implying the files match that commit.
-
-## Roadmap
-
-| Phase | Scope |
-| --- | --- |
-| 1 (MVP, this release) | `init_workspace`, draft/confirm/preview/list/rollback, default ignore rules, English README + MIT license |
-| 2 | `create_branch`/`switch_branch` (already shipped in this release), tag search over large histories, snapshot size warnings, session-context rehydration that survives a DSH restart |
-| 3 | Export/backup of the checkpoint store, a timeline UI, per-reply commit attribution from the timeline the route already returns, cross-workspace checkpoint index |
+  `__ModuleLoader__` bundle shape. If DSH changes either, the badge disappears while
+  the tools keep working — which is why the display model is testable independently
+  of the slot wiring.
+- **git version differences.** `git switch` needs 2.23+; the plugin falls back to
+  `git checkout`. Nothing else requires a recent git.
 
 ## License
 
