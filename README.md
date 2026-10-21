@@ -21,6 +21,11 @@ It ships as an MCP stdio server with nine tools, uses the system `git` binary
 (no bundled git library), and never performs a destructive git operation
 without a human-confirmed, single-use token.
 
+It also ships a browser half: every finalized reply in the DSH web UI carries a
+small badge with the commit the workspace is currently on
+(`main 4e850e7`, `*` for uncommitted changes, `⚑` when that commit is a
+confirmed checkpoint).
+
 ---
 
 ## Requirements
@@ -29,7 +34,7 @@ without a human-confirmed, single-use token.
 | --- | --- | --- |
 | Node.js | ≥ 20 | developed on Node 26; the session reader prefers `node:zlib` zstd support and falls back to the `zstd` CLI |
 | git | ≥ 2.23 recommended | `git switch` is used when available, `git checkout` otherwise |
-| DSH | any build with `@deepseek-ai/dsh-mcp-client` | the plugin is a standard MCP stdio server |
+| DSH | any build with `@deepseek-ai/dsh-mcp-client` | the commit badge additionally needs a web profile (the desktop or `web` app) |
 
 `git` must be installed and on `PATH`; the plugin never installs it for you.
 
@@ -50,15 +55,17 @@ node dist/index.js --help
 
 ## Register with DSH
 
-A profile composes plugin *bundles*; the user layer of a profile can only patch
-entries that already exist, so mounting a new MCP server is either done by
-installing this package as a bundle (recommended) or by inserting the entry by
-hand.
+The package has two halves and `cordis.patch.yml` mounts both:
+
+| Half | Composited entry | What it does |
+| --- | --- | --- |
+| **MCP server** | `agent-checkpoint-mcp` → `@deepseek-ai/dsh-mcp-client` | the nine tools, spawned over stdio |
+| **host plugin** | `agent-checkpoint` → `dsh-plugin-agent-checkpoint` | one loopback JSON route the browser badge reads |
+
+A profile composes plugin *bundles*, and its user layer can only patch entries
+that already exist, so installing this package as a bundle is the intended path.
 
 ### Option A — install as a bundle (recommended)
-
-The package ships `cordis.patch.yml` and declares `dsh.bundle.patch`, so DSH
-installs it as a profile layer and mounts the MCP server automatically:
 
 ```bash
 dsh plugin --profile web add link:/absolute/path/to/dsh-plugin-agent-checkpoint
@@ -66,15 +73,29 @@ dsh plugin --profile web add link:/absolute/path/to/dsh-plugin-agent-checkpoint
 
 (`add dsh-plugin-agent-checkpoint` instead, once it is published to npm.)
 
-Restart DSH. The tools appear prefixed with the server name, e.g.
-`mcp__agent-checkpoint__create_draft_checkpoint`.
+The package declares `dsh.bundle.patch`, so DSH appends it to
+`dsh.profile.bundles` and applies `cordis.patch.yml` on the next boot. Restart
+DSH: the tools appear as `mcp__agent-checkpoint__<tool>` and the badge appears
+under every finalized assistant reply.
 
-The default workspace is the directory DSH was launched from. To pin a specific
-project, override the entry in the profile's own `cordis.patch.yml` — an
-override *replaces* the whole `config` object, so repeat every key you need:
+The workspace is resolved per request (see the badge section below); the MCP
+server falls back to `$DSH_AGENT_CHECKPOINT_WORKSPACE`, then `$DSH_WORKSPACE`,
+then the directory DSH was launched from. To pin both halves, export it before
+launching:
+
+```bash
+export DSH_AGENT_CHECKPOINT_WORKSPACE=/absolute/path/to/your/project
+```
+
+or override the entries in the profile's own `cordis.patch.yml` (an override
+*replaces* the whole `config` object, so repeat every key you need):
 
 ```yaml
 - id: agent-checkpoint
+  config:
+    workspace: /absolute/path/to/your/project
+
+- id: agent-checkpoint-mcp
   config:
     transport: stdio
     serverName: agent-checkpoint
@@ -82,26 +103,28 @@ override *replaces* the whole `config` object, so repeat every key you need:
     args:
       - !!js decodeURIComponent(new URL('node_modules/dsh-plugin-agent-checkpoint/dist/index.js', baseUrl).pathname)
       - "--workspace"
-      - "/absolute/path/to/your/project"
-    cwd: "/absolute/path/to/your/project"
+      - /absolute/path/to/your/project
+    cwd: /absolute/path/to/your/project
     toolCallTimeoutMs: 120000
     failOnStartupError: true
 ```
 
 `baseUrl` inside `!!js` is the profile directory, so the first argument resolves
-to the installed copy of the server. Instead of editing YAML you can also export
-`DSH_AGENT_CHECKPOINT_WORKSPACE=/absolute/path/to/your/project` before launching
-DSH; the bundle patch uses it for both the workspace argument and `cwd`.
+to the installed copy of the MCP server.
 
-### Option B — insert the entry by hand
+### Option B — insert the entries by hand
 
-If you prefer not to install the package into the profile, append an `insert`
-block to the profile's `cordis.patch.yml` (for the desktop profile:
-`~/.dsh/profiles/desktop/cordis.patch.yml`):
+If you prefer not to install the package into the profile, append one `insert`
+block with both entries to the profile's `cordis.patch.yml` (for the desktop
+profile: `~/.dsh/profiles/desktop/cordis.patch.yml`):
 
 ```yaml
 - insert:
     - id: agent-checkpoint
+      name: dsh-plugin-agent-checkpoint
+      config:
+        workspace: /absolute/path/to/your/project
+    - id: agent-checkpoint-mcp
       name: "@deepseek-ai/dsh-mcp-client"
       config:
         transport: stdio
@@ -117,7 +140,9 @@ block to the profile's `cordis.patch.yml` (for the desktop profile:
 ```
 
 A bare `- id: …` entry at the top level of that file does **not** work: patch
-entries without `insert:` only override entries that already exist.
+entries without `insert:` only override entries that already exist. Drop the
+host entry if you only want the tools and no badge — the MCP half works on its
+own (including in `headless` profiles, where no web server exists).
 
 ### Verifying the registration
 
@@ -125,12 +150,75 @@ entries without `insert:` only override entries that already exist.
 dsh --profile web --dump-config | grep -A 12 agent-checkpoint
 ```
 
-The composed entry list should contain the `@deepseek-ai/dsh-mcp-client` row. If
-the MCP server then fails to start, DSH reports the spawn error at boot; run the
-server manually (`node dist/index.js --workspace <project>`) to see its own
-diagnostics.
+The composed entry list should contain both rows. If the MCP server fails to
+start, DSH reports the spawn error at boot; run the server manually
+(`node dist/index.js --workspace <project>`) to see its own diagnostics. For the
+badge, open a conversation in the same profile and check the action strip under
+any finished reply, or call the route directly:
 
-### CLI options
+```bash
+curl -s 'http://127.0.0.1:<port>/api/agent-checkpoint/git' | head -c 400
+```
+
+## Commit badge in the web UI
+
+Every finalized assistant message gets one quiet pill in its action strip:
+
+```
+⎇ main 4e850e7 *    ⚑
+```
+
+- `4e850e7` — short hash of the workspace HEAD; **click copies the full hash**,
+  the tooltip carries branch, subject, commit time, checkpoint id and workspace.
+- `*` — the workspace has uncommitted changes (so the badge never claims the
+  files match the commit when they do not).
+- `⚑` — that commit is a **confirmed checkpoint**; hover for its title. This is
+  the visual link between the git history and the plugin's snapshot library.
+
+### Where the numbers come from
+
+The browser cannot read a repository, so the badge calls the plugin's own
+same-origin route, served by the host half:
+
+| Aspect | Behavior |
+| --- | --- |
+| Route | `GET /api/agent-checkpoint/git?session=<sessionId>&limit=<n>` |
+| Access | loopback only (`127.0.0.0/8`, `::1`, `::ffff:` forms); anything else gets `403` |
+| Methods | `GET` and `HEAD` only; `405` otherwise |
+| Response | `{ ok, workspace, source, isRepo, branch, head, isDirty, commits[], capturedAt, error, warnings }` with `cache-control: no-store` |
+| Workspace | `?workspace=` takes precedence, otherwise the **cwd of the session you are viewing** (read from its `session.v*.jsonl` header), then the entry config, `$DSH_WORKSPACE`, cwd |
+| History | up to `limit` (default 50, max 500) recent commits, each annotated with the checkpoint that produced it |
+| Writes | none — the route never commits, resets or stages; destructive work stays behind the MCP tools' confirmation tokens |
+| Polling | 20 s per mounted badge, paused while the tab is hidden; one request is shared by every badge of the same session, and snapshots are memoized for 8 s |
+
+The route is read-only on purpose: a UI that could move `HEAD` would make the
+"no destructive operation without confirmation" guarantee meaningless.
+
+The badge shows the workspace HEAD as of the last poll — it is a *current*
+indicator, not a per-message provenance record. Attributing each reply to the
+commit that was current when it was written needs the per-turn timeline that the
+route already returns; that is a roadmap item, not a promise.
+
+Entering a workspace that is not a git repository simply hides the badge (the
+route answers `{ ok: false, error: "not_a_git_repo" }` once, and the client
+stops polling a "show nothing" state).
+
+### Badge configuration
+
+| Key | Default | Meaning |
+| --- | --- | --- |
+| `workspace` | auto-detected | fallback workspace when a request carries no `?session=` |
+| `maxCommits` | `120` | server-side cap on the returned history; the badge asks for 50, requests clamp to 500 |
+
+The browser half has no configuration: it is registered into the
+`conversation.chat.assistant-actions` list slot with id `agent-checkpoint-commit`
+and order `60`, so it coexists with the built-in feedback buttons instead of
+competing for the single `turnTail` chain slot.
+
+## CLI options
+
+`node dist/index.js` runs the MCP server half (normally spawned by DSH; useful
+standalone for debugging):
 
 ```
 dsh-plugin-agent-checkpoint [options]
@@ -343,9 +431,24 @@ pnpm test            # builds, compiles tests, runs node:test
 ```
 
 The suite covers the service against real temporary git repositories, the
-config loader, the session-log reader (including zstd compressed fixtures), and
-the MCP transport itself (it spawns `dist/index.js` and talks to it as a
-client). 37 tests, no network access, no writes outside the OS temp dir.
+config loader, the session-log reader (including zstd compressed fixtures), the
+MCP transport itself (it spawns `dist/index.js` and talks to it as a client),
+the loopback route (workspace resolution, timeline, loopback/method fences) and
+the browser bundle (loaded in a `node:vm` sandbox with a React shim, so the slot
+wiring and the display model are exercised without a DOM). 63 tests, no network
+access, no writes outside the OS temp dir.
+
+Layout:
+
+```
+src/index.ts      MCP stdio server (nine tools)
+src/checkpoint.ts service: drafts, confirmation, rollback
+src/host.ts       web host half: loopback git route
+src/session.ts    DSH session-log discovery and digest
+src/git.ts        system git wrapper
+src/store.ts      .dsh-checkpoint storage and confirmation tokens
+client/client.js  browser half: commit badge (no build step)
+```
 
 ## Risks and maintenance surface
 
@@ -363,6 +466,14 @@ client). 37 tests, no network access, no writes outside the OS temp dir.
 - **Repository identity.** If the repository has no `user.name`/`user.email`
   configured, the plugin writes a repository-local placeholder identity so
   commits do not fail; set a real identity for real commits.
+- **Client bundle contract.** `client/client.js` targets the DSH web slot API
+  (`conversation.chat.assistant-actions`, `ctx.slots`/`ctx.locale`) and the
+  `__ModuleLoader__` bundle shape. If DSH changes either, the badge disappears
+  from the UI while the tools keep working; the host route and the display model
+  stay independently testable, which is why they are split from the slot wiring.
+- **Badge semantics.** The badge reports the current workspace HEAD, not the
+  commit that existed when each reply was written; a dirty marker prevents it
+  from implying the files match that commit.
 
 ## Roadmap
 
@@ -370,7 +481,7 @@ client). 37 tests, no network access, no writes outside the OS temp dir.
 | --- | --- |
 | 1 (MVP, this release) | `init_workspace`, draft/confirm/preview/list/rollback, default ignore rules, English README + MIT license |
 | 2 | `create_branch`/`switch_branch` (already shipped in this release), tag search over large histories, snapshot size warnings, session-context rehydration that survives a DSH restart |
-| 3 | Export/backup of the checkpoint store, a timeline UI, cross-workspace checkpoint index |
+| 3 | Export/backup of the checkpoint store, a timeline UI, per-reply commit attribution from the timeline the route already returns, cross-workspace checkpoint index |
 
 ## License
 

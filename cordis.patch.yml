@@ -1,16 +1,28 @@
 # dsh-plugin-agent-checkpoint bundle patch
 #
-# Mounts the plugin's MCP stdio server into the profile composition through
-# `@deepseek-ai/dsh-mcp-client`. Because this package declares
-# `dsh.bundle.patch`, `dsh plugin --profile <name> add link:<path>` installs it
-# and appends it to `dsh.profile.bundles` automatically, which applies this
-# patch the next time the profile boots.
+# Mounts both halves of the plugin into the profile composition:
 #
-# The default workspace is the directory DSH was launched from. Pin a specific
-# project by overriding the entry in the profile's own `cordis.patch.yml`
-# (patch overrides replace the whole `config` object):
+#   agent-checkpoint      the HOST half — a loopback route
+#                         (/api/agent-checkpoint/git) plus the browser half
+#                         declared by `dsh.client` in package.json, which shows
+#                         the workspace's current commit under every reply.
+#   agent-checkpoint-mcp  the MCP stdio server — the nine checkpoint tools,
+#                         provided by `@deepseek-ai/dsh-mcp-client`.
+#
+# Because this package declares `dsh.bundle.patch`, `dsh plugin --profile <name>
+# add link:<path>` installs it and appends it to `dsh.profile.bundles`, which
+# applies this patch the next time the profile boots.
+#
+# The reported workspace defaults to the session's own `cwd` (read from the DSH
+# session log), then to the directory DSH was launched from. Pin a specific
+# project by exporting DSH_AGENT_CHECKPOINT_WORKSPACE before launching DSH, or
+# override the entries in the profile's own `cordis.patch.yml` (a patch override
+# replaces the whole `config` object, so repeat every key you need):
 #
 #   - id: agent-checkpoint
+#     config:
+#       workspace: /absolute/path/to/project
+#   - id: agent-checkpoint-mcp
 #     config:
 #       transport: stdio
 #       serverName: agent-checkpoint
@@ -24,9 +36,17 @@
 #       failOnStartupError: true
 #
 # `baseUrl` is the profile directory, so the first argument resolves to the
-# installed copy of the server inside the profile's node_modules.
+# installed copy of the MCP server inside the profile's node_modules.
 - insert:
+    # Host half. Inert outside the Web GUI: `inject: ['webServer']` simply waits
+    # on a headless profile, so this entry costs nothing there.
     - id: agent-checkpoint
+      name: dsh-plugin-agent-checkpoint
+      config:
+        workspace: !!js process.env.DSH_AGENT_CHECKPOINT_WORKSPACE ?? ''
+    # MCP half: the checkpoint tools an agent calls through the confirmation
+    # handshake.
+    - id: agent-checkpoint-mcp
       name: '@deepseek-ai/dsh-mcp-client'
       config:
         transport: stdio

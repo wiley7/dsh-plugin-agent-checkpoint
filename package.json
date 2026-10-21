@@ -3,13 +3,14 @@
   "version": "0.1.0",
   "description": "Session-aware checkpoint manager for DeepSeek Harness (DSH). Pairs git file snapshots with serialized agent conversation context.",
   "type": "module",
-  "main": "dist/index.js",
-  "types": "dist/index.d.ts",
+  "main": "./dist/host.js",
+  "types": "./dist/host.d.ts",
   "bin": {
     "dsh-plugin-agent-checkpoint": "./dist/index.js"
   },
   "files": [
     "dist",
+    "client",
     "cordis.patch.yml",
     "README.md",
     "LICENSE"
@@ -49,6 +50,19 @@
   "dsh": {
     "bundle": {
       "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web",
+      "inject": [
+        "@deepseek-ai/dsh-client-ui-chat",
+        "@deepseek-ai/dsh-client-locale"
+      ]
     }
+  },
+  "exports": {
+    ".": "./dist/host.js",
+    "./client": "./client/client.js",
+    "./mcp": "./dist/index.js",
+    "./package.json": "./package.json"
   }
 }
