@@ -11,7 +11,7 @@ import path from 'node:path';
 import { after, before, describe, it } from 'node:test';
 import * as zlib from 'node:zlib';
 
-import { captureSessionContext, digestEvents, discoverSessionLog, readSessionHeader, scrubText } from '../session.js';
+import { captureSessionContext, digestEvents, discoverSessionLog, readSessionHeader, scrubText, sessionIdsMatch } from '../session.js';
 import { makeWorkspace, sampleSessionEvents, toJsonl, type TempWorkspace } from './helpers.js';
 
 const LIMITS = { maxMessageChars: 200, maxMessages: 10, maxBytes: 64 * 1024 };
@@ -111,7 +111,7 @@ describe('session capture', () => {
 
   it('locates and digests a zstd-compressed session log for the workspace cwd', async () => {
     const jsonl = toJsonl(sampleSessionEvents({ sessionId: 'session-zstd', cwd: workspace.dir }));
-    const file = await writeSession(workspace.dshHome, 'bucket-a', 'session-session-zstd', jsonl, { zstd: true });
+    const file = await writeSession(workspace.dshHome, 'bucket-a', 'session-zstd', jsonl, { zstd: true });
 
     const header = await readSessionHeader(file);
     assert.equal(header?.id, 'session-zstd');
@@ -138,9 +138,9 @@ describe('session capture', () => {
 
   it('prefers the explicitly named session id even when another log is newer', async () => {
     const older = toJsonl(sampleSessionEvents({ sessionId: 'session-wanted', cwd: workspace.dir }));
-    const wantedFile = await writeSession(workspace.dshHome, 'bucket-b', 'session-session-wanted', older, { zstd: true });
+    const wantedFile = await writeSession(workspace.dshHome, 'bucket-b', 'session-wanted', older, { zstd: true });
     const newer = toJsonl(sampleSessionEvents({ sessionId: 'session-other', cwd: '/somewhere/else' }));
-    await writeSession(workspace.dshHome, 'bucket-b', 'session-session-other', newer);
+    await writeSession(workspace.dshHome, 'bucket-b', 'session-other', newer);
 
     const discovered = await discoverSessionLog({
       workspacePath: workspace.dir,
@@ -148,6 +148,26 @@ describe('session capture', () => {
       dshHome: workspace.dshHome,
     });
     assert.equal(discovered.file, wantedFile);
+  });
+
+  it('finds a session by id when the directory is named after the id (real DSH layout)', async () => {
+    const id = 'session-real-shape';
+    const file = await writeSession(workspace.dshHome, 'bucket-real', id, toJsonl(sampleSessionEvents({ sessionId: id, cwd: workspace.dir })));
+
+    const byFullId = await discoverSessionLog({ workspacePath: '', sessionId: id, dshHome: workspace.dshHome });
+    assert.equal(byFullId.file, file, 'a session id equal to the directory name must match');
+
+    // Callers may hold the id without its `session-` prefix; both forms name the
+    // same log, and DSH itself writes ids with the prefix.
+    const byBareId = await discoverSessionLog({ workspacePath: '', sessionId: 'real-shape', dshHome: workspace.dshHome });
+    assert.equal(byBareId.file, file, 'a prefix-less id must match the prefixed directory');
+
+    assert.equal(sessionIdsMatch(id, id), true);
+    assert.equal(sessionIdsMatch(id, 'real-shape'), true);
+    assert.equal(sessionIdsMatch('real-shape', id), true);
+    assert.equal(sessionIdsMatch(null, id), false);
+    assert.equal(sessionIdsMatch(id, ''), false);
+    assert.equal(sessionIdsMatch(id, 'session-other'), false);
   });
 
   it('reports a warning and an empty context when nothing matches', async () => {

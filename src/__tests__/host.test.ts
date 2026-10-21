@@ -89,7 +89,8 @@ async function commitAll(dir: string, message: string): Promise<void> {
 
 /** Write a compressed DSH session log whose header carries `cwd`. */
 async function writeSessionLog(dshHome: string, sessionId: string, cwd: string): Promise<string> {
-  const dir = path.join(dshHome, 'sessions', '--tmp--', `session-${sessionId}`);
+  // DSH names the directory after the session id itself (`session-<uuid>`).
+  const dir = path.join(dshHome, 'sessions', '--tmp--', sessionId.startsWith('session-') ? sessionId : `session-${sessionId}`);
   await mkdir(dir, { recursive: true });
   const file = path.join(dir, 'session.v4.jsonl.zstd');
   const jsonl = toJsonl(sampleSessionEvents({ sessionId, cwd }));

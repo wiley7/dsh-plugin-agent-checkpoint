@@ -39,11 +39,36 @@ const SESSION_FILE_RE = /^session\.v(\d+)\.jsonl(\.zstd)?$/;
 
 export interface SessionFileCandidate {
   file: string;
-  /** Session id taken from the directory name when available. */
+  /**
+   * Session directory name, exactly as DSH wrote it. Current DSH names the
+   * directory after the session id itself (`session-<uuid>`), so this is
+   * compared with {@link sessionIdsMatch} rather than by equality: whether a
+   * caller passes `session-<uuid>` or the bare `<uuid>`, both forms match.
+   */
   sessionIdFromDir: string | null;
   version: number;
   compressed: boolean;
   mtimeMs: number;
+}
+
+/** DSH session id prefix; ids appear both with and without it in the wild. */
+const SESSION_ID_PREFIX = 'session-';
+
+/**
+ * Compare a session directory name with a requested session id.
+ *
+ * Real logs use `session.v4.jsonl.zstd` inside a directory named after the
+ * session id (`session-<uuid>`), while callers may hold the same id with or
+ * without the prefix. Equality alone therefore misses every real log.
+ * @param dirName - directory name taken from the session store, or null.
+ * @param wanted - session id supplied by the caller.
+ * @returns whether both name the same session.
+ */
+export function sessionIdsMatch(dirName: string | null, wanted: string): boolean {
+  if (dirName === null || dirName === '' || wanted === '') return false;
+  if (dirName === wanted) return true;
+  const bare = (value: string): string => (value.startsWith(SESSION_ID_PREFIX) ? value.slice(SESSION_ID_PREFIX.length) : value);
+  return bare(dirName) === bare(wanted);
 }
 
 export interface SessionHeader {
@@ -147,7 +172,7 @@ export async function listSessionFiles(dshHome?: string | null): Promise<Session
       const file = path.join(sessionPath, best.name);
       const info = await stat(file).catch(() => null);
       if (!info?.isFile()) continue;
-      const dirSessionId = /^session-(.+)$/.exec(sessionDir)?.[1] ?? null;
+      const dirSessionId = sessionDir;
       found.push({
         file,
         sessionIdFromDir: dirSessionId,
@@ -323,7 +348,7 @@ export async function discoverSessionLog(options: DiscoverOptions): Promise<Disc
   }
 
   const byId = options.sessionId
-    ? candidates.filter((candidate) => candidate.sessionIdFromDir === options.sessionId)
+    ? candidates.filter((candidate) => sessionIdsMatch(candidate.sessionIdFromDir, options.sessionId!))
     : [];
 
   const probeOrder = [ ...byId, ...candidates.filter((candidate) => !byId.includes(candidate)) ].slice(0, probeLimit);
