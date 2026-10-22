@@ -4,6 +4,8 @@
  * @module dsh-plugin-agent-checkpoint/types
  */
 
+import type { ProjectMode } from './policy.js';
+
 /** A single todo-plan entry mirrored from the DSH session. */
 export interface PlanItem {
   content: string;
@@ -143,6 +145,15 @@ export interface CheckpointConfig {
   max_diff_chars: number;
   /** Lifetime of a two-phase confirmation token, in seconds. */
   confirmation_ttl_seconds: number;
+  /**
+   * This project's own automatic-checkpoint preset.
+   *
+   * `inherit` (the default) defers to the profile settings; every other value
+   * overrides them for this repository only.
+   */
+  mode: ProjectMode;
+  /** Cadence the `interval` preset uses, in turns. */
+  interval_turns: number;
 }
 
 /** Repository facts surfaced by `get_status` / `init_workspace`. */

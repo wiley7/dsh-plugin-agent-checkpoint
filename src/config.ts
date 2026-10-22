@@ -8,10 +8,18 @@
  * @module dsh-plugin-agent-checkpoint/config
  */
 
-import { readFile } from 'node:fs/promises';
+import { mkdir, readFile, rename, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
+import {
+  DEFAULT_PROJECT_MODE,
+  INTERVAL_TURNS_MAX,
+  INTERVAL_TURNS_MIN,
+  PROJECT_MODES,
+  isProjectMode,
+  type ProjectMode,
+} from './policy.js';
 import type { CheckpointConfig } from './types.js';
 
 /** Name of the configuration file read from the workspace root. */
@@ -38,6 +46,8 @@ export const DEFAULT_CONFIG: Readonly<CheckpointConfig> = Object.freeze({
   max_context_bytes: 512 * 1024,
   max_diff_chars: 100_000,
   confirmation_ttl_seconds: 600,
+  mode: DEFAULT_PROJECT_MODE,
+  interval_turns: 5,
 });
 
 /** Result of reading the workspace configuration. */
@@ -127,6 +137,15 @@ export function normalizeConfig(
     if (value !== null) config.confirmation_ttl_seconds = value;
     else warnings.push('confirmation_ttl_seconds must be an integer between 30 and 86400');
   }
+  if ('mode' in input) {
+    if (isProjectMode(input.mode)) config.mode = input.mode;
+    else warnings.push(`mode must be one of ${PROJECT_MODES.join(', ')}`);
+  }
+  if ('interval_turns' in input) {
+    const value = asPositiveInt(input.interval_turns, INTERVAL_TURNS_MIN, INTERVAL_TURNS_MAX);
+    if (value !== null) config.interval_turns = value;
+    else warnings.push(`interval_turns must be an integer between ${INTERVAL_TURNS_MIN} and ${INTERVAL_TURNS_MAX}`);
+  }
   return { config, warnings };
 }
 
@@ -167,6 +186,111 @@ export async function loadConfig(workspacePath: string): Promise<LoadedConfig> {
 
   const { config, warnings } = normalizeConfig(parsed);
   return { config, path: configPath, found: true, warnings };
+}
+
+/**
+ * Raised when the project config exists but cannot be rewritten safely.
+ *
+ * Refusing is the whole point: silently replacing an unparseable
+ * `checkpoint.config.json` would throw away whatever the repository owner put
+ * in it.
+ */
+export class ConfigError extends Error {
+  readonly code: 'config_invalid' | 'config_unreadable';
+
+  constructor(code: 'config_invalid' | 'config_unreadable', message: string) {
+    super(message);
+    this.name = 'ConfigError';
+    this.code = code;
+  }
+}
+
+/** Result of writing a project's preset back to disk. */
+export interface WrittenProjectMode {
+  /** Absolute path of the file that was written. */
+  path: string;
+  /** True when the file did not exist before. */
+  created: boolean;
+  /** The preset now stored in the file. */
+  mode: ProjectMode;
+  /** The cadence now stored in the file. */
+  intervalTurns: number;
+  /** The whole file re-read through the normal validator. */
+  config: CheckpointConfig;
+  /** Keys that were present but rejected, with a reason. */
+  warnings: string[];
+}
+
+/** Clamp a cadence into the documented range. */
+function clampTurns(value: number | undefined, fallback: number): number {
+  if (value === undefined || !Number.isFinite(value)) return fallback;
+  const rounded = Math.round(value);
+  if (rounded < INTERVAL_TURNS_MIN) return INTERVAL_TURNS_MIN;
+  if (rounded > INTERVAL_TURNS_MAX) return INTERVAL_TURNS_MAX;
+  return rounded;
+}
+
+/**
+ * Store a project's checkpoint preset in its own `checkpoint.config.json`.
+ *
+ * Every other key in the file is preserved verbatim, so a repository that
+ * already configures ignore patterns or context limits keeps them. The write is
+ * temp-file + rename, matching the rest of the plugin's storage: a crash must
+ * not leave a half-written config behind.
+ *
+ * @param workspacePath - repository root owning the config.
+ * @param options - the preset to store and, optionally, its cadence.
+ * @returns what is now on disk, re-validated.
+ */
+export async function writeProjectMode(
+  workspacePath: string,
+  options: { mode: ProjectMode; intervalTurns?: number },
+): Promise<WrittenProjectMode> {
+  const configPath = path.join(workspacePath, CONFIG_FILENAME);
+  let raw: Record<string, unknown> = {};
+  let created = true;
+  let text: string | null = null;
+  try {
+    text = await readFile(configPath, 'utf8');
+  } catch (error) {
+    const code = (error as NodeJS.ErrnoException).code;
+    if (code !== 'ENOENT') {
+      throw new ConfigError(
+        'config_unreadable',
+        `cannot read ${CONFIG_FILENAME}: ${(error as Error).message}`,
+      );
+    }
+  }
+  if (text !== null) {
+    created = false;
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(text);
+    } catch (error) {
+      throw new ConfigError(
+        'config_invalid',
+        `refusing to overwrite ${CONFIG_FILENAME}: ${(error as Error).message}`,
+      );
+    }
+    if (parsed === null || typeof parsed !== 'object' || Array.isArray(parsed)) {
+      throw new ConfigError(
+        'config_invalid',
+        `refusing to overwrite ${CONFIG_FILENAME}: it does not contain a JSON object`,
+      );
+    }
+    raw = parsed as Record<string, unknown>;
+  }
+
+  const previous = normalizeConfig(raw).config;
+  const intervalTurns = clampTurns(options.intervalTurns, previous.interval_turns);
+  const next: Record<string, unknown> = { ...raw, mode: options.mode, interval_turns: intervalTurns };
+  const body = `${JSON.stringify(next, null, 2)}\n`;
+  const tmpPath = `${configPath}.${process.pid.toString(36)}.tmp`;
+  await mkdir(path.dirname(configPath), { recursive: true });
+  await writeFile(tmpPath, body, 'utf8');
+  await rename(tmpPath, configPath);
+  const { config, warnings } = normalizeConfig(next);
+  return { path: configPath, created, mode: config.mode, intervalTurns: config.interval_turns, config, warnings };
 }
 
 /** Directory of this module, used to exclude the plugin's own sources if needed. */

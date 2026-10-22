@@ -16,12 +16,19 @@ import type { IncomingMessage, ServerResponse } from 'node:http';
 import { realpath, stat } from 'node:fs/promises';
 import { isAbsolute, resolve as resolvePath } from 'node:path';
 import { CheckpointError, CheckpointService } from './checkpoint.js';
+import { ConfigError, loadConfig, writeProjectMode } from './config.js';
 import { currentBranch, git, headHash, isDirty, isInsideWorkTree, topLevel } from './git.js';
 import {
   createPolicyState,
+  DEFAULT_PROJECT_MODE,
   installPolicySettings,
+  normalizeProjectMode,
   POLICY_NAMESPACE,
+  PROJECT_MODES,
+  projectPolicyOf,
+  type AutoPolicy,
   type PolicyState,
+  type ProjectMode,
   type SettingsServiceLike,
 } from './policy.js';
 import { attributeMessages, type CheckpointPoint, type MessageAttribution } from './attribution.js';
@@ -38,6 +45,8 @@ export const inject = [ 'webServer' ];
 export const ROUTE_PATH = '/api/agent-checkpoint/git';
 /** Exact route that initialises a project so the badge has something to show. */
 export const INIT_ROUTE_PATH = '/api/agent-checkpoint/init';
+/** Exact route the browser half reads and writes the project preset through. */
+export const POLICY_ROUTE_PATH = '/api/agent-checkpoint/policy';
 /** Commits returned when the caller does not ask for a specific window. */
 export const DEFAULT_MAX_COMMITS = 120;
 /** Upper bound for `?limit=`, so one request cannot read a whole monorepo history. */
@@ -597,6 +606,200 @@ export async function handleInitRequest(
 }
 
 /**
+ * Read a small JSON request body, or null when it is unusable.
+ * @param req - request carrying the body.
+ * @param limit - maximum accepted size in bytes.
+ */
+async function readJsonBody(req: IncomingMessage, limit: number): Promise<unknown | null> {
+  const chunks: Buffer[] = [];
+  let total = 0;
+  for await (const chunk of req) {
+    const buffer = typeof chunk === 'string' ? Buffer.from(chunk, 'utf8') : (chunk as Buffer);
+    total += buffer.length;
+    if (total > limit) return null;
+    chunks.push(buffer);
+  }
+  if (total === 0) return null;
+  try {
+    return JSON.parse(Buffer.concat(chunks).toString('utf8')) as unknown;
+  } catch {
+    return null;
+  }
+}
+
+/** The JSON body of {@link POLICY_ROUTE_PATH}. */
+export interface ProjectPolicyResponse {
+  ok: boolean;
+  /** Absolute project the answer is about. */
+  workspace: string;
+  source: WorkspaceSource;
+  sessionId: string | null;
+  /** This project's own preset, `inherit` when it does not decide. */
+  mode: ProjectMode;
+  /** Cadence stored with the preset. */
+  intervalTurns: number;
+  /** False when the project follows the profile settings. */
+  overrides: boolean;
+  /** The policy the trigger engine will actually use for this project. */
+  effective: AutoPolicy;
+  /** Where `effective` came from. */
+  effectiveFrom: 'project' | 'settings';
+  /** The presets a project may store. */
+  modes: ProjectMode[];
+  /** Absolute path of the file the preset lives in. */
+  configPath: string;
+  /** True when that file exists. */
+  configFound: boolean;
+  warnings: string[];
+  error?: string;
+  message?: string;
+}
+
+/**
+ * Answer "what will happen in this project, and where does that come from?".
+ *
+ * The settings page describes the profile-wide default; this is the same
+ * question for one repository, which is what the operator actually needs to
+ * know before writing code.
+ * @param workspace - absolute project directory.
+ * @param source - how the workspace was resolved.
+ * @param sessionId - session that asked, when one did.
+ * @param resolutionWarnings - warnings produced while resolving the workspace.
+ * @param settingsPolicy - the profile-wide policy to fall back to.
+ */
+export async function describeProjectPolicy(
+  workspace: string,
+  source: WorkspaceSource,
+  sessionId: string | null,
+  resolutionWarnings: string[],
+  settingsPolicy: AutoPolicy,
+): Promise<ProjectPolicyResponse> {
+  const loaded = await loadConfig(workspace);
+  const mode = normalizeProjectMode(loaded.config.mode);
+  const intervalTurns = loaded.config.interval_turns;
+  const project = projectPolicyOf(mode, intervalTurns);
+  return {
+    ok: true,
+    workspace,
+    source,
+    sessionId,
+    mode,
+    intervalTurns,
+    overrides: project !== null,
+    effective: project ?? settingsPolicy,
+    effectiveFrom: project === null ? 'settings' : 'project',
+    modes: [ ...PROJECT_MODES ],
+    configPath: loaded.path,
+    configFound: loaded.found,
+    warnings: [ ...resolutionWarnings, ...loaded.warnings ],
+  };
+}
+
+/**
+ * Serve one `/api/agent-checkpoint/policy` request.
+ *
+ * `GET` reports the project's current preset and the policy that follows from
+ * it. `POST` stores a new preset in the project's own `checkpoint.config.json`,
+ * which is why it is loopback-only, POST-only and validated: this is a file the
+ * repository owner may have committed, so unknown values are rejected instead
+ * of coerced, and every other key in the file is preserved.
+ * @param req - incoming loopback request.
+ * @param res - response owned by this handler.
+ * @param config - host half configuration.
+ * @param settingsPolicy - profile-wide policy, read when the project defers.
+ */
+export async function handlePolicyRequest(
+  req: IncomingMessage,
+  res: ServerResponse,
+  config: AgentCheckpointHostConfig = {},
+  settingsPolicy: AutoPolicy = createPolicyState().get(),
+): Promise<void> {
+  if (!isLoopbackAddress(req.socket?.remoteAddress)) {
+    sendJson(res, 403, { ok: false, error: 'forbidden', message: 'agent-checkpoint only answers loopback requests' });
+    return;
+  }
+  const method = (req.method ?? 'GET').toUpperCase();
+  if (method !== 'GET' && method !== 'HEAD' && method !== 'POST') {
+    res.setHeader('allow', 'GET, HEAD, POST');
+    sendJson(res, 405, { ok: false, error: 'method_not_allowed' });
+    return;
+  }
+
+  let url: URL;
+  try {
+    url = new URL(req.url ?? POLICY_ROUTE_PATH, 'http://localhost');
+  } catch {
+    sendJson(res, 400, { ok: false, error: 'invalid_request_target' });
+    return;
+  }
+
+  const resolution = await resolveWorkspace({
+    workspace: queryParam(url, 'workspace'),
+    sessionId: queryParam(url, 'session'),
+    config,
+  });
+
+  if (method === 'POST') {
+    const body = await readJsonBody(req, 8 * 1024);
+    if (typeof body !== 'object' || body === null || Array.isArray(body)) {
+      sendJson(res, 400, {
+        ok: false,
+        error: 'invalid_body',
+        message: 'expected a JSON object with a mode field',
+        workspace: resolution.workspace,
+      });
+      return;
+    }
+    const record = body as Record<string, unknown>;
+    const requested = record.mode;
+    if (typeof requested !== 'string' || !(PROJECT_MODES as readonly string[]).includes(requested)) {
+      sendJson(res, 400, {
+        ok: false,
+        error: 'invalid_mode',
+        message: `mode must be one of ${PROJECT_MODES.join(', ')}`,
+        workspace: resolution.workspace,
+      });
+      return;
+    }
+    const intervalTurns = typeof record.intervalTurns === 'number' ? record.intervalTurns : undefined;
+    const directory = await stat(resolution.workspace).catch(() => null);
+    if (directory === null || !directory.isDirectory()) {
+      sendJson(res, 404, {
+        ok: false,
+        error: 'workspace_missing',
+        message: 'the resolved project directory does not exist',
+        workspace: resolution.workspace,
+      });
+      return;
+    }
+    try {
+      await writeProjectMode(resolution.workspace, {
+        mode: normalizeProjectMode(requested),
+        intervalTurns,
+      });
+    } catch (error) {
+      const code = error instanceof ConfigError ? error.code : 'config_write_failed';
+      sendJson(res, code === 'config_invalid' ? 409 : 400, {
+        ok: false,
+        error: code,
+        message: error instanceof Error ? error.message : String(error),
+        workspace: resolution.workspace,
+      });
+      return;
+    }
+  }
+
+  const body = await describeProjectPolicy(
+    resolution.workspace,
+    resolution.source,
+    resolution.sessionId,
+    resolution.warnings,
+    settingsPolicy,
+  );
+  sendJson(res, 200, body);
+}
+
+/**
  * Commit message for a checkpoint the plugin created on its own.
  * @param request - what the trigger engine asked for.
  * @returns a one-line conventional message.
@@ -651,6 +854,15 @@ export function createAutomaticCheckpoints(options: AutomaticCheckpointOptions):
 
   const engine = createTriggerEngine({
     policy: () => policy.get(),
+    // Read per turn: the operator may change a project's preset while the
+    // session runs, and the next turn must honour the new answer.
+    workspacePolicy: async (workspace: string) => {
+      const loaded = await loadConfig(workspace).catch(() => null);
+      if (loaded === null) return null;
+      const mode = normalizeProjectMode(loaded.config.mode);
+      if (mode === DEFAULT_PROJECT_MODE) return null;
+      return projectPolicyOf(mode, loaded.config.interval_turns);
+    },
     workspaceFor: async (sessionId: string) => {
       if (!workspaces.has(sessionId)) {
         const resolution = await resolveWorkspace({ sessionId, config: options.config }).catch(() => null);
@@ -697,6 +909,13 @@ export function createAutomaticCheckpoints(options: AutomaticCheckpointOptions):
  */
 export function apply(ctx: PluginContextLike, rawConfig: unknown = {}): void {
   const config = normalizeHostConfig(rawConfig);
+
+  // Automatic checkpoints: the settings namespace is what the browser card
+  // edits, and the engine is what acts on it. Both degrade to a no-op on a host
+  // without `settings` / `session/event`, which is how the plugin behaved before
+  // the feature existed.
+  const { engine, policy } = createAutomaticCheckpoints({ config });
+
   const register = () => {
     const disposers = [
       ctx.webServer.register({
@@ -709,6 +928,13 @@ export function apply(ctx: PluginContextLike, rawConfig: unknown = {}): void {
         path: INIT_ROUTE_PATH,
         handler: (req, res) => handleInitRequest(req, res, config),
       }),
+      ctx.webServer.register({
+        kind: 'exact',
+        path: POLICY_ROUTE_PATH,
+        // Read on demand rather than captured, so a route created before the
+        // settings scope resolves still reports the value that is live now.
+        handler: (req, res) => handlePolicyRequest(req, res, config, policy.get()),
+      }),
     ];
     return () => {
       for (const dispose of disposers) dispose();
@@ -717,11 +943,6 @@ export function apply(ctx: PluginContextLike, rawConfig: unknown = {}): void {
   if (typeof ctx.effect === 'function') ctx.effect(register, 'agent-checkpoint: git badge routes');
   else register();
 
-  // Automatic checkpoints: the settings namespace is what the browser card
-  // edits, and the engine is what acts on it. Both degrade to a no-op on a host
-  // without `settings` / `session/event`, which is how the plugin behaved before
-  // the feature existed.
-  const { engine, policy } = createAutomaticCheckpoints({ config });
   const startAutomation = () => {
     installPolicySettings(ctx, policy);
     const on = ctx.on;

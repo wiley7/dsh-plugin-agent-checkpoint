@@ -11,7 +11,7 @@ context that produced them.
 | **File storage** | native `git` CLI, in your own repository; the plugin invents no new file format |
 | **Context storage** | JSON sidecars under `.dsh-checkpoint/` in the workspace |
 | **Destructive operations** | always two-phase: a human-confirmed, single-use token is required |
-| **Automatic checkpoints** | optional, configured in DSH **Settings → Plugins**: off, on file change, every message, or every N messages |
+| **Automatic checkpoints** | optional: a profile-wide default in DSH **Settings → Plugins**, overridable per project from a button in the conversation header |
 | **Network** | none. Local only, no telemetry, no push/pull/fetch |
 | **Requires** | Node.js ≥ 20, `git` ≥ 2.23 (recommended), a DSH build with `@deepseek-ai/dsh-mcp-client` |
 
@@ -123,9 +123,14 @@ git history by itself. `Commit right away` is the one setting that produces real
 commits without a confirmation token — you opt into it explicitly, and the badge
 under each reply shows the result.
 
-No new HTTP route is involved: the browser card edits the `agent-checkpoint`
-settings namespace through DSH's own settings service, and the host half reacts
-to `turn/end` events. See [Automatic checkpoints](#automatic-checkpoints).
+The card is the *default* for every project. Each project can then choose its own
+mode from the **⚑** button in the conversation header — "draft when files change",
+"commit after every reply", "off", and so on — and that choice is written into the
+project's own `checkpoint.config.json`, so it survives a restart and travels with
+the repository. See [Automatic checkpoints](#automatic-checkpoints).
+
+The card itself edits the `agent-checkpoint` settings namespace through DSH's own
+settings service; the host half reacts to `turn/end` events.
 
 ### Why not just `git stash` / `git commit` / tags?
 
@@ -320,7 +325,9 @@ server can snapshot, roll back and branch several projects without a restart.
 By default the plugin only saves when you ask the assistant to. If you would
 rather have it save by itself, open **Settings → Plugins → Automatic checkpoints**
 (the card appears only when the host half is loaded, because the card and the
-namespace are the two halves of the same feature).
+namespace are the two halves of the same feature). That card is the **profile-wide
+default**; a single project can override it from the **⚑** button in the
+conversation header, described [below](#per-project-modes).
 
 ### The two questions the card asks
 
@@ -370,9 +377,49 @@ expose `@deepseek-ai/schemastery` — the plugin never fails to start because of
 Builds without a settings service simply show no card and never save
 automatically.
 
-This is separate from `checkpoint.config.json`: that file holds per-workspace
-limits and ignore rules (see [Configuration](#configuration)); the trigger policy
-lives in DSH settings so it is editable without touching the project.
+This is the *default* for the whole profile. A project that wants something else
+stores a preset in its own `checkpoint.config.json` — see
+[Per-project modes](#per-project-modes) — which is also where the per-workspace
+limits and ignore rules live (see [Configuration](#configuration)).
+
+### Per-project modes
+
+Open any conversation in a project and click the **⚑** button in the conversation
+header. The menu shows what will happen in *this* project now, with the seven
+presets below; picking one saves it immediately.
+
+| Preset | Saves when | As |
+| --- | --- | --- |
+| `Follow Settings` (default) | whatever the profile default says | the default's choice |
+| `Off` | never — ask the assistant when you want a checkpoint | — |
+| `Draft when files change` | a reply modified files | draft |
+| `Draft after every reply` | every reply, even with no file change | draft |
+| `Commit when files change` | a reply modified files | real git commit |
+| `Commit after every reply` | every reply | real git commit |
+| `Every few replies` | every N replies (`N` = 1–50, default 5) | draft |
+
+The choice is stored in the project, not in the profile:
+
+```jsonc
+// <workspace>/checkpoint.config.json
+{
+  "mode": "draft_on_change",   // one of the seven presets; "inherit" = follow Settings
+  "interval_turns": 5,         // only used by "every few replies"
+  "max_draft_count": 10        // every other key is preserved untouched
+}
+```
+
+- **Precedence.** A project preset wins over the profile default. `Follow Settings`
+  (stored as `"inherit"`, the default) means "do not override".
+- **The write is narrow.** Only `mode` and `interval_turns` change; hand-written
+  keys, comments-free JSON formatting and unknown future keys all survive. A file
+  that cannot be parsed is *refused*, not overwritten (`409 config_invalid`), and an
+  unknown preset is rejected instead of coerced.
+- **It works headless too.** The button talks to `GET/POST
+  /api/agent-checkpoint/policy`; the same file can be edited by hand or committed
+  by hand — the host half re-reads it on every turn, so no restart is needed.
+- **The badge still tells the truth.** Automatic saves appear under the replies
+  they belong to, whichever level chose the mode.
 
 ## The commit badge in the web UI
 
@@ -450,16 +497,16 @@ at. A folder that lives inside another repository answers
 
 ### Route reference
 
-| Aspect | `GET /api/agent-checkpoint/git` | `POST /api/agent-checkpoint/init` |
-| --- | --- | --- |
-| Purpose | read the badge snapshot | enable checkpoints for a project |
-| Access | loopback only (`127.0.0.0/8`, `::1`, `::ffff:` forms); else `403` | same |
-| Methods | `GET`, `HEAD`; else `405` | `POST`; else `405` |
-| Guard | none | `confirm=1` required, else `400 confirmation_required` and **no write** |
-| Response | `{ ok, workspace, source, isRepo, branch, head, isDirty, commits[], attribution[], capturedAt, error, warnings }` | `{ ok, workspace, created, gitVersion, branch, head, gitignoreUpdated, excludeUpdated, storePath, configPath, warnings, nextSteps }` |
-| Caching | `cache-control: no-store` | same |
-| Writes | none — never commits, stages or resets | working tree and `.git` (init, ignore rules, store) |
-| Errors | `not_a_git_repo`, `invalid_workspace` | `confirmation_required`, `workspace_not_repository_root` (409) |
+| Aspect | `GET /api/agent-checkpoint/git` | `POST /api/agent-checkpoint/init` | `GET`/`POST /api/agent-checkpoint/policy` |
+| --- | --- | --- | --- |
+| Purpose | read the badge snapshot | enable checkpoints for a project | read or store the project's mode |
+| Access | loopback only (`127.0.0.0/8`, `::1`, `::ffff:` forms); else `403` | same | same |
+| Methods | `GET`, `HEAD`; else `405` | `POST`; else `405` | `GET`, `HEAD`, `POST`; else `405` |
+| Guard | none | `confirm=1` required, else `400 confirmation_required` and **no write** | body must be `{ "mode": "<preset>", "intervalTurns"?: 1–50 }` |
+| Response | `{ ok, workspace, source, isRepo, branch, head, isDirty, commits[], attribution[], capturedAt, error, warnings }` | `{ ok, workspace, created, gitVersion, branch, head, gitignoreUpdated, excludeUpdated, storePath, configPath, warnings, nextSteps }` | `{ ok, workspace, source, sessionId, mode, intervalTurns, overrides, effective, effectiveFrom, modes[], configPath, configFound, warnings }` |
+| Caching | `cache-control: no-store` | same | same |
+| Writes | none — never commits, stages or resets | working tree and `.git` (init, ignore rules, store) | `checkpoint.config.json` in the project (`mode`, `interval_turns`) |
+| Errors | `not_a_git_repo`, `invalid_workspace` | `confirmation_required`, `workspace_not_repository_root` (409) | `invalid_mode` / `invalid_body` (400), `config_invalid` (409) |
 
 `GET` also accepts `?workspace=<path>` and `?limit=<n>`; the badge polls every
 20 s (paused while the tab is hidden), shares one request per session, and
@@ -479,7 +526,8 @@ request carries no `?session=`) and `maxCommits` (default `120`; requests clamp 
 `500`). The browser half itself has no configuration — it registers into the
 `conversation.chat.assistant-actions` list slot with id `agent-checkpoint-commit`
 and order `60`, so it coexists with the built-in feedback buttons rather than
-competing for the single `turnTail` chain slot.
+competing for the single `turnTail` chain slot. The mode button registers into
+`conversation.session.header.actions` (id `agent-checkpoint-policy`, order `30`).
 
 ## Tool reference
 
@@ -568,7 +616,9 @@ to the defaults; invalid values produce warnings but never abort a tool call.
 {
   "auto_draft_on_milestone": true,
   "ignore_patterns": ["node_modules", ".venv", "dist", "build"],
-  "max_draft_count": 10
+  "max_draft_count": 10,
+  "mode": "inherit",
+  "interval_turns": 5
 }
 ```
 
@@ -582,10 +632,13 @@ to the defaults; invalid values produce warnings but never abort a tool call.
 | `max_context_bytes` | `524288` | hard cap per serialized context; oldest messages are dropped first |
 | `max_diff_chars` | `100000` | inline diff cap; longer diffs go to `.dsh-checkpoint/diffs/` |
 | `confirmation_ttl_seconds` | `600` | lifetime of a confirmation token |
+| `mode` | `"inherit"` | this project's checkpoint mode: `inherit`, `off`, `draft_on_change`, `draft_each_turn`, `commit_on_change`, `commit_each_turn`, `interval` |
+| `interval_turns` | `5` | cadence for `mode: "interval"` (1–50) |
 
 `auto_draft_on_milestone` is a *hint* read by `get_status`; it does not create
-anything. The behaviour that actually saves automatically lives in
-[Automatic checkpoints](#automatic-checkpoints) (DSH settings), not in this file.
+anything. What actually saves automatically is `mode` here (per project, written by
+the header button) falling back to the profile default in DSH settings — both are
+described under [Automatic checkpoints](#automatic-checkpoints).
 
 ## Storage layout
 
@@ -716,23 +769,27 @@ pnpm test            # builds, compiles tests, runs node:test
 ```
 
 The suite covers the service against real temporary git repositories, the config
-loader, the session-log reader (including zstd fixtures), the MCP transport itself
-(it spawns `dist/index.js` and talks to it as a client), both loopback routes
-(workspace resolution, timeline, method and loopback fences, the init guard) and
-the browser bundle (loaded in a `node:vm` sandbox with a React shim, so slot wiring,
-the display model, the per-reply attribution and the init control are exercised
-without a DOM).
-**128 tests, no network access, no writes outside the OS temp dir.**
+loader and its preset writer, the trigger engine (including a project preset
+overriding the profile default), the session-log reader (including zstd fixtures),
+the MCP transport itself (it spawns `dist/index.js` and talks to it as a client),
+all three loopback routes (workspace resolution, timeline, method and loopback
+fences, the init guard, the policy read/write) and the browser bundle (loaded in a
+`node:vm` sandbox with a React shim, so slot wiring, the display model, the
+per-reply attribution, the init control and the mode menu are exercised without a
+DOM).
+**146 tests, no network access, no writes outside the OS temp dir.**
 
 ```
 src/index.ts      MCP stdio server (nine tools)
 src/checkpoint.ts service: drafts, confirmation, rollback
-src/host.ts       web host half: loopback git + init routes
+src/config.ts     checkpoint.config.json loading and the project preset writer
+src/policy.ts     trigger policy vocabulary (profile settings + project presets)
+src/host.ts       web host half: loopback git, init and policy routes
 src/attribution.ts  reply → checkpoint mapping (pure projection)
 src/session.ts    DSH session-log discovery, digest and per-turn timeline
 src/git.ts        system git wrapper
 src/store.ts      .dsh-checkpoint storage and confirmation tokens
-client/client.js  browser half: commit badge (no build step)
+client/client.js  browser half: commit badge, project mode menu (no build step)
 ```
 
 ## Limitations and roadmap
@@ -742,7 +799,7 @@ client/client.js  browser half: commit badge (no build step)
 | Destructive ops | two-phase token | same, plus approving from the badge |
 | Context rehydration | tool result digest + sidecar | survive a DSH restart by re-reading sidecars into a fresh session |
 | Badge | the checkpoint (or commit) current at each reply | inline preview/rollback from the badge |
-| Auto triggers | off / file change / every turn / every N turns (settings card) | per-language rules, per-workspace overrides, "only when tests pass" |
+| Auto triggers | off / file change / every turn / every N turns, as a profile default with a per-project override | per-language rules, "only when tests pass" |
 | Settings surface | trigger + save mode | ignore rules and draft limits editable from the same card |
 | Branching | local create/switch | store export/backup, timeline UI, cross-workspace index |
 | Out of scope | push/pull/fetch, remotes, collaboration, automatic conflict resolution, binary large-object handling, background scheduling, checkpoint deletion | — |

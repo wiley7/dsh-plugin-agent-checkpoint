@@ -10,17 +10,19 @@
  */
 
 import assert from 'node:assert/strict';
-import { mkdir, realpath, writeFile } from 'node:fs/promises';
+import { mkdir, realpath, rm, writeFile } from 'node:fs/promises';
 import type { IncomingMessage, ServerResponse } from 'node:http';
 import path from 'node:path';
 import { after, before, describe, it } from 'node:test';
 import { zstdCompressSync } from 'node:zlib';
 
+import { loadConfig, writeProjectMode } from '../config.js';
 import { runGit } from '../git.js';
 import {
   DEFAULT_MAX_COMMITS,
   INIT_ROUTE_PATH,
   MAX_COMMITS_LIMIT,
+  POLICY_ROUTE_PATH,
   ROUTE_PATH,
   apply,
   buildGitSnapshot,
@@ -28,6 +30,7 @@ import {
   createAutomaticCheckpoints,
   handleGitRequest,
   handleInitRequest,
+  handlePolicyRequest,
   isLoopbackAddress,
   normalizeHostConfig,
   parseMaxCommits,
@@ -463,7 +466,7 @@ describe('handleGitRequest', () => {
     assert.equal((body.commits as unknown[]).length, 1);
   });
 
-  it('registers both exact routes and the automatic-checkpoint effect', () => {
+  it('registers the three exact routes and the automatic-checkpoint effect', () => {
     const registrations: Array<{ kind: string; path: string; handler?: unknown }> = [];
     const labels: Array<string | undefined> = [];
     let disposed = 0;
@@ -482,7 +485,7 @@ describe('handleGitRequest', () => {
       },
     };
     apply(ctx as never, { workspace: workspace.dir });
-    assert.deepEqual(registrations.map((route) => route.path), [ ROUTE_PATH, INIT_ROUTE_PATH ]);
+    assert.deepEqual(registrations.map((route) => route.path), [ ROUTE_PATH, INIT_ROUTE_PATH, POLICY_ROUTE_PATH ]);
     assert.ok(registrations.every((route) => route.kind === 'exact'));
     assert.equal(disposed, 0);
     assert.equal(labels.length, 2);
@@ -694,6 +697,188 @@ describe('handleInitRequest', () => {
       assert.equal(body.source, 'session');
       assert.equal(body.sessionId, 'session-init-viewed');
       assert.equal(body.workspace, await realpath(workspace.dir));
+    } finally {
+      await workspace.cleanup();
+    }
+  });
+});
+
+/** A request carrying a JSON body, enough for `readJsonBody`. */
+function fakeJsonRequest(options: { url?: string; method?: string; remoteAddress?: string; body?: unknown; raw?: string }): IncomingMessage {
+  const text = options.raw !== undefined ? options.raw : options.body === undefined ? '' : JSON.stringify(options.body);
+  const chunks = text === '' ? [] : [ Buffer.from(text, 'utf8') ];
+  return {
+    url: options.url ?? POLICY_ROUTE_PATH,
+    method: options.method ?? 'POST',
+    socket: { remoteAddress: options.remoteAddress ?? '127.0.0.1' },
+    async *[Symbol.asyncIterator]() {
+      for (const chunk of chunks) yield chunk;
+    },
+  } as unknown as IncomingMessage;
+}
+
+describe('handlePolicyRequest', () => {
+  let workspace: TempWorkspace;
+  const settings = { trigger: 'turn' as const, apply: 'commit' as const, interval_turns: 5 };
+
+  before(async () => {
+    workspace = await makeWorkspace('ckpt-host-policy-');
+    await runGit(workspace.dir, [ 'init', '--initial-branch=main' ]);
+    await configureIdentity(workspace.dir);
+    await writeWorkspaceFile(workspace.dir, 'app.ts', 'export const x = 1;\n');
+    await commitAll(workspace.dir, 'initial import');
+  });
+
+  after(async () => {
+    await workspace.cleanup();
+  });
+
+  it('reports inheritance from the profile settings when the project has no preset', async () => {
+    const { res, recorded } = fakeResponse();
+    await handlePolicyRequest(fakeRequest({ url: POLICY_ROUTE_PATH }), res, { workspace: workspace.dir }, settings);
+    assert.equal(recorded.statusCode, 200, recorded.body);
+    const body = bodyOf(recorded);
+    assert.equal(body.ok, true);
+    assert.equal(body.workspace, await realpath(workspace.dir));
+    assert.equal(body.mode, 'inherit');
+    assert.equal(body.overrides, false);
+    assert.equal(body.effectiveFrom, 'settings');
+    assert.deepEqual(body.effective, settings);
+    assert.equal(body.configFound, false);
+    assert.match(String(body.configPath), /checkpoint\.config\.json$/);
+    assert.equal((body.modes as string[]).length, 7);
+  });
+
+  it('stores a preset in the project file and reports it as the effective policy', async () => {
+    const { res, recorded } = fakeResponse();
+    await handlePolicyRequest(
+      fakeJsonRequest({ body: { mode: 'commit_each_turn', intervalTurns: 9 } }),
+      res,
+      { workspace: workspace.dir },
+      { trigger: 'off', apply: 'draft', interval_turns: 5 },
+    );
+    assert.equal(recorded.statusCode, 200, recorded.body);
+    const body = bodyOf(recorded);
+    assert.equal(body.mode, 'commit_each_turn');
+    assert.equal(body.overrides, true);
+    assert.equal(body.effectiveFrom, 'project');
+    assert.deepEqual(body.effective, { trigger: 'turn', apply: 'commit', interval_turns: 9 });
+    assert.equal(body.configFound, true);
+
+    const loaded = await loadConfig(workspace.dir);
+    assert.equal(loaded.config.mode, 'commit_each_turn');
+    assert.equal(loaded.config.interval_turns, 9);
+
+    const read = fakeResponse();
+    await handlePolicyRequest(fakeRequest({ url: POLICY_ROUTE_PATH }), read.res, { workspace: workspace.dir }, settings);
+    assert.equal(bodyOf(read.recorded).mode, 'commit_each_turn', 'the read reports what the write stored');
+    assert.deepEqual(bodyOf(read.recorded).effective, { trigger: 'turn', apply: 'commit', interval_turns: 9 });
+  });
+
+  it('rejects a preset it does not know instead of coercing it', async () => {
+    const { res, recorded } = fakeResponse();
+    await handlePolicyRequest(fakeJsonRequest({ body: { mode: 'yolo' } }), res, { workspace: workspace.dir }, settings);
+    assert.equal(recorded.statusCode, 400);
+    const body = bodyOf(recorded);
+    assert.equal(body.error, 'invalid_mode');
+    assert.match(String(body.message), /inherit, off, draft_on_change/);
+    const loaded = await loadConfig(workspace.dir);
+    assert.equal(loaded.config.mode, 'commit_each_turn', 'a refused preset leaves the file alone');
+  });
+
+  it('rejects a body that is not a JSON object', async () => {
+    for (const raw of [ '', '[1,2]', '{oops' ]) {
+      const { res, recorded } = fakeResponse();
+      await handlePolicyRequest(fakeJsonRequest({ raw }), res, { workspace: workspace.dir }, settings);
+      assert.equal(recorded.statusCode, 400, raw);
+      assert.equal(bodyOf(recorded).error, 'invalid_body');
+    }
+  });
+
+  it('refuses to overwrite a config file it cannot parse', async () => {
+    await writeFile(path.join(workspace.dir, 'checkpoint.config.json'), '{ not json', 'utf8');
+    try {
+      const { res, recorded } = fakeResponse();
+      await handlePolicyRequest(fakeJsonRequest({ body: { mode: 'off' } }), res, { workspace: workspace.dir }, settings);
+      assert.equal(recorded.statusCode, 409);
+      assert.equal(bodyOf(recorded).error, 'config_invalid');
+    } finally {
+      await rm(path.join(workspace.dir, 'checkpoint.config.json'), { force: true });
+    }
+  });
+
+  it('fences the route to loopback and to GET, HEAD and POST', async () => {
+    const foreign = fakeResponse();
+    await handlePolicyRequest(fakeRequest({ url: POLICY_ROUTE_PATH, remoteAddress: '10.1.2.3' }), foreign.res, { workspace: workspace.dir }, settings);
+    assert.equal(foreign.recorded.statusCode, 403);
+    assert.equal(bodyOf(foreign.recorded).error, 'forbidden');
+
+    const wrong = fakeResponse();
+    await handlePolicyRequest(fakeRequest({ url: POLICY_ROUTE_PATH, method: 'DELETE' }), wrong.res, { workspace: workspace.dir }, settings);
+    assert.equal(wrong.recorded.statusCode, 405);
+    assert.equal(wrong.recorded.headers.allow, 'GET, HEAD, POST');
+  });
+});
+
+describe('project preset overrides the profile policy', () => {
+  /** A repository with identity and one commit, plus a session log naming it. */
+  async function prepared(prefix: string, sessionId: string) {
+    const workspace = await makeWorkspace(prefix);
+    await runGit(workspace.dir, [ 'init', '-b', 'main' ]);
+    await configureIdentity(workspace.dir);
+    await writeWorkspaceFile(workspace.dir, 'app.txt', 'one\n');
+    await commitAll(workspace.dir, 'initial import');
+    const dshHome = process.env.DSH_HOME;
+    assert.ok(dshHome);
+    await writeSessionLog(dshHome, sessionId, workspace.dir);
+    return workspace;
+  }
+
+  it('saves when the project asks for it even though the profile default is off', async () => {
+    const workspace = await prepared('ckpt-host-preset-on-', 'session-preset-on');
+    try {
+      await writeProjectMode(workspace.dir, { mode: 'draft_each_turn' });
+      const { engine, policy } = createAutomaticCheckpoints({ config: {}, log: () => undefined });
+      policy.adopt({ trigger: 'off', apply: 'draft' });
+      const outcome = await engine.handle({ id: 'session-preset-on' }, { type: 'turn/end', data: { turn: 2 } });
+      assert.equal(outcome.fired, true);
+      assert.equal(outcome.fired === true && outcome.status, 'draft');
+      const { listAllCheckpoints } = await import('../store.js');
+      const records = await listAllCheckpoints(workspace.dir);
+      assert.equal(records.length, 1);
+      assert.deepEqual(records[0]?.tags, [ 'auto', 'turn' ]);
+    } finally {
+      await workspace.cleanup();
+    }
+  });
+
+  it('stays quiet when the project itself is off although the profile would save', async () => {
+    const workspace = await prepared('ckpt-host-preset-off-', 'session-preset-off');
+    try {
+      await writeProjectMode(workspace.dir, { mode: 'off' });
+      const { engine, policy } = createAutomaticCheckpoints({ config: {}, log: () => undefined });
+      policy.adopt({ trigger: 'turn', apply: 'commit' });
+      await writeWorkspaceFile(workspace.dir, 'app.txt', 'two\n');
+      const outcome = await engine.handle({ id: 'session-preset-off' }, { type: 'turn/end', data: { turn: 1 } });
+      assert.equal(outcome.fired, false);
+      assert.equal(outcome.fired === false && outcome.reason, 'trigger_off');
+      const subject = await gitOut(workspace.dir, [ 'log', '-1', '--pretty=%s' ]);
+      assert.equal(subject.trim(), 'initial import', 'nothing was committed behind the project opt-out');
+    } finally {
+      await workspace.cleanup();
+    }
+  });
+
+  it('falls back to the profile policy when the project says "inherit"', async () => {
+    const workspace = await prepared('ckpt-host-preset-inherit-', 'session-preset-inherit');
+    try {
+      await writeProjectMode(workspace.dir, { mode: 'inherit' });
+      const { engine, policy } = createAutomaticCheckpoints({ config: {}, log: () => undefined });
+      policy.adopt({ trigger: 'file_change', apply: 'draft' });
+      await writeWorkspaceFile(workspace.dir, 'app.txt', 'three\n');
+      const outcome = await engine.handle({ id: 'session-preset-inherit' }, { type: 'turn/end', data: { turn: 1 } });
+      assert.equal(outcome.fired, true);
+      assert.equal(outcome.fired === true && outcome.status, 'draft');
     } finally {
       await workspace.cleanup();
     }

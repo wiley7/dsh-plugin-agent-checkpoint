@@ -78,8 +78,15 @@ export interface TriggerCheckpointResult {
 
 /** Everything the engine needs from the outside world. */
 export interface TriggerDeps {
-  /** Live policy from Settings. */
+  /** Live policy from Settings: the answer when a project does not decide. */
   policy(): AutoPolicy;
+  /**
+   * This project's own preset, or null when it follows the settings.
+   *
+   * Consulted per turn rather than cached, because the operator can change a
+   * project's preset from the session header while the session is running.
+   */
+  workspacePolicy?(workspace: string): Promise<AutoPolicy | null>;
   /** Project directory of a session, or null when the session names none. */
   workspaceFor(sessionId: string): Promise<string | null>;
   /** Whether a directory is the root of a git repository. */
@@ -190,13 +197,17 @@ export function createTriggerEngine(deps: TriggerDeps): TriggerEngine {
     turn: number | null,
     state: SessionTriggerState,
   ): Promise<TriggerOutcome> => {
-    const policy = deps.policy();
+    // The project is resolved before the policy is read: a project that picks
+    // its own mode overrides the profile-wide settings, so the answer depends
+    // on which project this session belongs to.
+    const workspace = await deps.workspaceFor(sessionId);
+    if (workspace === null || workspace.length === 0) return skip('no_workspace', turn);
+    const projectPolicy = await deps.workspacePolicy?.(workspace);
+    const policy = projectPolicy ?? deps.policy();
     if (policy.trigger === 'off') return skip('trigger_off', turn);
     if (turn !== null && state.lastFiredTurn === turn) return skip('already_fired', turn);
     if (policy.trigger === 'interval_turns' && state.turns % policy.interval_turns !== 0) return skip('not_due', turn);
 
-    const workspace = await deps.workspaceFor(sessionId);
-    if (workspace === null || workspace.length === 0) return skip('no_workspace', turn);
     if (!(await deps.isRepository(workspace))) return skip('not_a_repository', turn);
     // `file_change` and `interval_turns` exist precisely to skip quiet turns;
     // `turn` saves the conversation too, so a clean tree is fine there.

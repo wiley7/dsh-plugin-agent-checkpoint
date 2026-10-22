@@ -53,6 +53,77 @@ export const INTERVAL_TURNS_MIN = 1;
 /** Inclusive bounds for `interval_turns`. */
 export const INTERVAL_TURNS_MAX = 50;
 
+/**
+ * Presets a single project may choose, stored in its own
+ * `checkpoint.config.json`.
+ *
+ * The profile-wide settings are one answer for every repository. Real work does
+ * not look like that: a repository where every save should be a commit and a
+ * scratch repository where nothing should happen by itself want different
+ * answers. A preset is the coarse, self-explanatory choice ("save a draft when
+ * files change") that maps onto the same `AutoPolicy` the trigger engine
+ * already understands, so there is still exactly one engine and one policy
+ * shape — only the source of the answer differs.
+ */
+export const PROJECT_MODES = [
+  'inherit',
+  'off',
+  'draft_on_change',
+  'draft_each_turn',
+  'commit_on_change',
+  'commit_each_turn',
+  'interval',
+] as const;
+
+/** The values `mode` may hold in `checkpoint.config.json`. */
+export type ProjectMode = (typeof PROJECT_MODES)[number];
+
+/** A project that says nothing follows the profile settings. */
+export const DEFAULT_PROJECT_MODE: ProjectMode = 'inherit';
+
+/** Whether a value is one of the accepted project modes. */
+export function isProjectMode(value: unknown): value is ProjectMode {
+  return typeof value === 'string' && (PROJECT_MODES as readonly string[]).includes(value);
+}
+
+/**
+ * Coerce whatever the project config holds into a usable mode.
+ * @param value - the raw `mode` value, of unknown shape.
+ * @returns a known mode, `inherit` when the value is not one.
+ */
+export function normalizeProjectMode(value: unknown): ProjectMode {
+  return isProjectMode(value) ? value : DEFAULT_PROJECT_MODE;
+}
+
+/**
+ * Translate a project preset into the policy the trigger engine consumes.
+ *
+ * `null` means "this project does not decide", which is deliberately different
+ * from `off` (this project decided that nothing may be saved).
+ * @param mode - the project's preset.
+ * @param intervalTurns - the project's preferred cadence for `interval`.
+ * @returns the overriding policy, or `null` to fall back to the settings.
+ */
+export function projectPolicyOf(mode: ProjectMode, intervalTurns: number): AutoPolicy | null {
+  switch (mode) {
+    case 'off':
+      return { trigger: 'off', apply: 'draft', interval_turns: clampInterval(intervalTurns) };
+    case 'draft_on_change':
+      return { trigger: 'file_change', apply: 'draft', interval_turns: clampInterval(intervalTurns) };
+    case 'draft_each_turn':
+      return { trigger: 'turn', apply: 'draft', interval_turns: clampInterval(intervalTurns) };
+    case 'commit_on_change':
+      return { trigger: 'file_change', apply: 'commit', interval_turns: clampInterval(intervalTurns) };
+    case 'commit_each_turn':
+      return { trigger: 'turn', apply: 'commit', interval_turns: clampInterval(intervalTurns) };
+    case 'interval':
+      return { trigger: 'interval_turns', apply: 'draft', interval_turns: clampInterval(intervalTurns) };
+    case 'inherit':
+    default:
+      return null;
+  }
+}
+
 /** Where a policy value came from. */
 export type PolicySource = 'settings' | 'defaults';
 

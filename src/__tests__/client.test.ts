@@ -111,11 +111,12 @@ interface Bundle {
 }
 
 /** Load the browser bundle inside a vm sandbox. */
-async function loadBundle(options: { state?: unknown; response?: unknown; initResponse?: { status: number; body: unknown } } = {}): Promise<Bundle> {
+async function loadBundle(options: { state?: unknown; response?: unknown; initResponse?: { status: number; body: unknown }; policyResponses?: Array<{ status: number; body: unknown }> } = {}): Promise<Bundle> {
   const code = await readFile(BUNDLE, 'utf8');
   const meta: { id?: string; factory?: (require: (id: string) => unknown) => unknown } = {};
   const fetches: string[] = [];
   const requests: Array<{ url: string; method: string }> = [];
+  let policyReads = 0;
   const sandbox: Record<string, unknown> = {
     window: {
       __ModuleLoader__: {
@@ -149,6 +150,12 @@ async function loadBundle(options: { state?: unknown; response?: unknown; initRe
       fetches.push(url);
       requests.push({ url, method });
       const isInit = url.includes('/agent-checkpoint/init');
+      const isPolicy = url.includes('/agent-checkpoint/policy');
+      if (isPolicy && options.policyResponses !== undefined && options.policyResponses.length > 0) {
+        const pick = options.policyResponses[Math.min(policyReads, options.policyResponses.length - 1)]!;
+        policyReads += 1;
+        return { ok: pick.status >= 200 && pick.status < 300, status: pick.status, json: async () => pick.body };
+      }
       if (isInit && method === 'POST' && options.initResponse !== undefined) {
         return { ok: false, status: options.initResponse.status, json: async () => options.initResponse!.body };
       }
@@ -229,8 +236,17 @@ describe('client bundle contract', () => {
     assert.equal(JSON.stringify(requested), JSON.stringify([ [ 'settingsScope' ] ]));
     assert.equal(JSON.stringify(bound), JSON.stringify([ { namespace: 'agent-checkpoint' } ]));
     assert.deepEqual(dictionaries, [ 'agent-checkpoint' ]);
-    assert.equal(slotCalls.length, 2);
-    const card = slotCalls[1]!;
+    assert.equal(slotCalls.length, 3);
+    const header = slotCalls[0]!;
+    assert.equal(header.name, 'conversation.session.header.actions');
+    assert.equal(header.entry.name, 'conversation.session.header.actions');
+    assert.equal(header.entry.id, 'agent-checkpoint-policy');
+    assert.equal(header.entry.order, 30);
+    assert.equal(header.entry.locale, 'agent-checkpoint');
+    const headerFace = (header.entry.inject as (sessionId: string) => Record<string, unknown>)('session-abc');
+    assert.equal(headerFace.sessionId, 'session-abc');
+
+    const card = slotCalls[2]!;
     assert.equal(card.name, 'settings.plugin.item');
     assert.equal(card.entry.name, 'settings.plugin.item');
     assert.equal(card.entry.key, 'agent-checkpoint');
@@ -239,7 +255,7 @@ describe('client bundle contract', () => {
     assert.deepEqual(Object.keys(cardFace), [ 'hooks' ]);
     assert.ok((cardFace.hooks as Record<string, unknown>).checkpointPolicy);
 
-    const call = slotCalls[0]!;
+    const call = slotCalls[1]!;
     assert.equal(call.name, 'conversation.chat.assistant-actions');
     assert.equal(call.entry.name, 'conversation.chat.assistant-actions');
     assert.equal(call.entry.id, 'agent-checkpoint-commit');
@@ -501,6 +517,168 @@ describe('client store', () => {
     assert.equal(store.error('session-plain'), 'not_a_git_repo');
   });
 });
+
+describe('client project policy menu', () => {
+  /** Route body for a project that saved its own mode. */
+  const PROJECT = {
+    ok: true,
+    workspace: '/tmp/project',
+    source: 'session',
+    sessionId: 'session-abc',
+    mode: 'draft_on_change',
+    intervalTurns: 7,
+    overrides: true,
+    effective: { trigger: 'file_change', apply: 'draft', interval_turns: 7 },
+    effectiveFrom: 'project',
+    modes: [ 'inherit', 'off', 'draft_on_change', 'draft_each_turn', 'commit_on_change', 'commit_each_turn', 'interval' ],
+    configPath: '/tmp/project/checkpoint.config.json',
+    configFound: true,
+    warnings: [],
+  };
+
+  /** Flatten every string rendered under an element. */
+  function texts(node: unknown, out: string[] = []): string[] {
+    if (typeof node === 'string') {
+      out.push(node);
+      return out;
+    }
+    if (Array.isArray(node)) {
+      for (const child of node) texts(child, out);
+      return out;
+    }
+    if (node && typeof node === 'object') texts((node as Element).children, out);
+    return out;
+  }
+
+  /** Every mode row in the menu. */
+  function rows(node: unknown, out: Array<{ id: unknown; active: unknown; disabled: unknown }> = []) {
+    if (Array.isArray(node)) {
+      for (const child of node) rows(child, out);
+      return out;
+    }
+    if (node && typeof node === 'object') {
+      const element = node as Element;
+      const id = element.props['data-agent-checkpoint-choice'];
+      if (typeof id === 'string' && id.startsWith('project-mode-')) out.push({ id, active: element.props['data-active'], disabled: element.props.disabled });
+      rows(element.children, out);
+    }
+    return out;
+  }
+
+  it('lists the presets in plain language and marks the saved one', async () => {
+    const bundle = await loadBundle();
+    const { PROJECT_MODES, describeProjectMode, describeEffectivePolicy } = bundle.exports;
+    assert.equal(PROJECT_MODES.length, 7);
+    assert.deepEqual([ ...PROJECT_MODES ], [ 'inherit', 'off', 'draft_on_change', 'draft_each_turn', 'commit_on_change', 'commit_each_turn', 'interval' ]);
+
+    const t = (key: string) => key;
+    assert.equal(describeProjectMode('off', t).buttonLabel, 'project.mode.off.label');
+    // The cadence is part of the button, otherwise "every few replies" is unreadable.
+    assert.equal(describeProjectMode('interval', t, 9).buttonLabel, 'project.mode.interval.label · 9');
+    assert.equal(describeProjectMode('nonsense', t).id, 'inherit');
+    assert.equal(describeEffectivePolicy({ trigger: 'file_change', apply: 'draft' }, t), 'policy.trigger.file_change.label · policy.apply.draft.label');
+    assert.equal(describeEffectivePolicy({ trigger: 'off' }, t), 'project.effective.off');
+  });
+
+  it('reads a project mode and an inherited one from the route', async () => {
+    const bundle = await loadBundle();
+    const own = bundle.exports.normalizeProjectPolicy(PROJECT);
+    assert.equal(own.mode, 'draft_on_change');
+    assert.equal(own.intervalTurns, 7);
+    assert.equal(own.effectiveFrom, 'project');
+    assert.equal(own.overrides, true);
+    assert.equal(own.configPath, '/tmp/project/checkpoint.config.json');
+
+    const inherited = bundle.exports.normalizeProjectPolicy({ ...PROJECT, mode: 'inherit', overrides: false, effectiveFrom: 'settings', effective: { trigger: 'turn', apply: 'commit', interval_turns: 5 } });
+    assert.equal(inherited.overrides, false);
+    assert.equal(inherited.effectiveFrom, 'settings');
+
+    // Unknown files written by hand or by a newer build never turn into a lie.
+    assert.equal(bundle.exports.normalizeProjectPolicy({ ...PROJECT, mode: 'yolo' }).mode, 'inherit');
+    assert.equal(bundle.exports.normalizeProjectPolicy({ ok: false }), null);
+    assert.equal(bundle.exports.normalizeProjectPolicy(null), null);
+    assert.equal(bundle.exports.projectPolicyUrl('session-abc'), '/api/agent-checkpoint/policy?session=session-abc');
+  });
+
+  it('shows the current mode on the project button', async () => {
+    // Every useState is seeded, so the menu opens and the button still renders.
+    const bundle = await loadBundle({ state: { status: 'ready', policy: bundlePolicy(), saving: false } });
+    const element = bundle.exports.ProjectPolicyButton({ sessionId: 'session-abc', t: (key: string) => key }) as Element;
+    assert.ok(element, 'the button should render for a host that has the route');
+    const button = element.children.find((child) => typeof child === 'object' && child !== null && (child as Element).props['data-agent-checkpoint-policy-button'] !== undefined) as Element;
+    assert.ok(button, 'a mode button should be present');
+    assert.equal(button.props['data-agent-checkpoint-policy-button'], 'draft_on_change');
+    assert.equal(button.props['data-agent-checkpoint-policy-source'], 'project');
+    assert.equal(button.props.type, 'button');
+    assert.equal(button.props['aria-haspopup'], 'true');
+
+    const menu = element.children.find((child) => typeof child === 'object' && child !== null && (child as Element).props.className === 'dsh-agent-checkpoint-policy-menu') as Element;
+    assert.ok(menu, 'the popover should render next to the button');
+    const modeRows = rows(menu);
+    assert.equal(modeRows.length, 7);
+    assert.equal(modeRows.filter((row) => row.active === 'true').length, 1);
+    assert.ok(modeRows.every((row) => row.disabled === false));
+    const joined = texts(menu).join('\n');
+    assert.match(joined, /project\.title/);
+    assert.match(joined, /project\.now/);
+    assert.match(joined, /project\.note/);
+    assert.match(joined, /checkpoint\.config\.json/);
+  });
+
+  it('hides the button when the host has no policy route', async () => {
+    const bundle = await loadBundle();
+    const unavailable = bundle.exports.ProjectPolicyButton({
+      sessionId: 'session-abc',
+      t: (key: string) => key,
+    }) as Element | null;
+    // The store starts in "loading" here: a placeholder, never a guessed mode.
+    assert.ok(unavailable !== null);
+    assert.equal(unavailable.props['data-agent-checkpoint-policy'], 'loading');
+
+    const hidden = await loadBundle({ state: { status: 'unavailable', policy: null, saving: false, error: null } });
+    assert.equal(hidden.exports.ProjectPolicyButton({ sessionId: 'session-abc', t: (key: string) => key }), null);
+    assert.equal(hidden.exports.ProjectPolicyButton({ t: (key: string) => key }), null);
+  });
+
+  it('saves one preset and rolls the button back when the project refuses', async () => {
+    const bundle = await loadBundle({ policyResponses: [ { status: 200, body: PROJECT }, { status: 409, body: { ok: false, message: 'checkpoint.config.json is not valid JSON' } } ] });
+    const store = bundle.exports.createProjectPolicyStore();
+    const seen: Array<Record<string, unknown>> = [];
+    const detach = store.subscribe('session-abc', (state: Record<string, unknown>) => seen.push(state));
+    await store.refresh('session-abc');
+    assert.equal(store.peek('session-abc').status, 'ready');
+    assert.equal(store.peek('session-abc').policy.mode, 'draft_on_change');
+
+    await assert.rejects(() => store.set('session-abc', 'off', 5), /not valid JSON/);
+    assert.equal(store.peek('session-abc').policy.mode, 'draft_on_change', 'the refusal restores what the project file really says');
+    assert.equal(store.peek('session-abc').saving, false);
+    assert.match(String(store.peek('session-abc').error), /not valid JSON/);
+    assert.equal(bundle.requests.filter((request) => request.method === 'POST').length, 1);
+    detach();
+
+    // A same-origin policy URL is used for both the read and the write.
+    const urls = bundle.fetches.filter((url: string) => url.includes('/agent-checkpoint/policy'));
+    assert.equal(urls.length, 2);
+    assert.ok(urls.every((url: string) => url.includes('session=session-abc')));
+    assert.ok(seen.length >= 2);
+  });
+});
+
+/** The project model the button expects, kept next to the route fixture. */
+function bundlePolicy(): Record<string, unknown> {
+  return {
+    workspace: '/tmp/project',
+    mode: 'draft_on_change',
+    intervalTurns: 7,
+    overrides: true,
+    effective: { trigger: 'file_change', apply: 'draft', interval_turns: 7 },
+    effectiveFrom: 'project',
+    modes: [ 'inherit', 'off', 'draft_on_change', 'draft_each_turn', 'commit_on_change', 'commit_each_turn', 'interval' ],
+    configPath: '/tmp/project/checkpoint.config.json',
+    configFound: true,
+    warnings: [],
+  };
+}
 
 describe('client settings card', () => {
   /** Flatten every string rendered under an element, in document order. */

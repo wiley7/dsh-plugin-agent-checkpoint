@@ -78,7 +78,9 @@ describe('trigger engine decisions', () => {
     const outcome = await engine.handle({ id: 's1' }, end(1));
     assert.deepEqual(outcome, { fired: false, reason: 'trigger_off', turn: 1 });
     assert.equal(calls.length, 0);
-    assert.equal(counters.workspaceFor, 0);
+    // The workspace is resolved before the policy is judged: a project preset
+    // stored in that directory may override the profile-wide default.
+    assert.equal(counters.workspaceFor, 1);
     assert.equal(engine.state('s1')?.turns, 1);
   });
 

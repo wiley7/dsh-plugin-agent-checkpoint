@@ -40,6 +40,8 @@ window.__ModuleLoader__.load({
 		const ENDPOINT = "/api/agent-checkpoint/git";
 		/** Route that turns the viewed project into a checkpoint workspace. */
 		const INIT_ENDPOINT = "/api/agent-checkpoint/init";
+		/** Route that reads and writes the *project's own* checkpoint preset. */
+		const POLICY_ENDPOINT = "/api/agent-checkpoint/policy";
 		/** Newest commits the badge asks for; the head only needs the first row. */
 		const COMMIT_LIMIT = 50;
 		/** Background refresh cadence while the conversation is on screen. */
@@ -110,6 +112,118 @@ window.__ModuleLoader__.load({
 		function initUrl(sessionId) {
 			const params = new URLSearchParams({ session: String(sessionId), confirm: "1" });
 			return `${INIT_ENDPOINT}?${params.toString()}`;
+		}
+
+		/**
+		 * Presets one project may pick, in menu order.
+		 *
+		 * These are deliberately concrete ("save a draft when files change")
+		 * rather than the engine's internal ids: the reader is deciding what
+		 * should happen in their project, not configuring a trigger table. Every
+		 * preset maps onto the same policy the settings page writes.
+		 */
+		const PROJECT_MODES = [ "inherit", "off", "draft_on_change", "draft_each_turn", "commit_on_change", "commit_each_turn", "interval" ];
+		/** A project that has not chosen follows the profile-wide settings. */
+		const PROJECT_DEFAULT_MODE = "inherit";
+		/** Last-resort labels, so a missing dictionary never blanks the menu. */
+		const PROJECT_MODE_FALLBACKS = {
+			inherit: "Follow settings",
+			off: "Off",
+			draft_on_change: "Draft when files change",
+			draft_each_turn: "Draft after every reply",
+			commit_on_change: "Commit when files change",
+			commit_each_turn: "Commit after every reply",
+			interval: "Every few replies",
+		};
+
+		/**
+		 * Request URL for the project-preset route.
+		 * @param sessionId - session whose log header names the project.
+		 * @returns same-origin URL with the session encoded.
+		 */
+		function projectPolicyUrl(sessionId) {
+			const params = new URLSearchParams({ session: String(sessionId) });
+			return `${POLICY_ENDPOINT}?${params.toString()}`;
+		}
+
+		/**
+		 * Normalize the project-preset route answer.
+		 *
+		 * Unknown ids fall back to `inherit` instead of being rendered: a config
+		 * file edited by hand, or written by a newer build, must not turn the
+		 * button into a lie about what is going to happen.
+		 * @param raw - parsed JSON body of the policy route, or null.
+		 * @returns a project policy model, or null when the payload is unusable.
+		 */
+		function normalizeProjectPolicy(raw) {
+			if (raw === null || typeof raw !== "object" || Array.isArray(raw)) return null;
+			if (raw.ok !== true) return null;
+			const workspace = typeof raw.workspace === "string" && raw.workspace !== "" ? raw.workspace : null;
+			const mode = PROJECT_MODES.indexOf(raw.mode) >= 0 ? raw.mode : PROJECT_DEFAULT_MODE;
+			const intervalTurns = clampIntervalTurns(raw.intervalTurns);
+			const modes = Array.isArray(raw.modes) ? raw.modes.filter((id) => PROJECT_MODES.indexOf(id) >= 0) : PROJECT_MODES;
+			return {
+				workspace,
+				mode,
+				intervalTurns: intervalTurns === null ? POLICY_DEFAULTS.interval_turns : intervalTurns,
+				overrides: raw.overrides === true,
+				effective: normalizePolicyValue(raw.effective),
+				effectiveFrom: raw.effectiveFrom === "project" ? "project" : "settings",
+				modes: modes.length > 0 ? modes : PROJECT_MODES,
+				configPath: typeof raw.configPath === "string" && raw.configPath !== "" ? raw.configPath : null,
+				configFound: raw.configFound === true,
+				warnings: Array.isArray(raw.warnings) ? raw.warnings.filter((warning) => typeof warning === "string") : [],
+			};
+		}
+
+		/**
+		 * Fold one preset into the strings the menu renders.
+		 * @param mode - preset id.
+		 * @param t - locale function.
+		 * @param intervalTurns - cadence, appended to the interval preset label.
+		 * @returns `{ id, label, hint, buttonLabel }`.
+		 */
+		function describeProjectMode(mode, t, intervalTurns) {
+			const id = PROJECT_MODES.indexOf(mode) >= 0 ? mode : PROJECT_DEFAULT_MODE;
+			const read = (key, fallback, params) => {
+				try {
+					const translated = typeof t === "function" ? t(key, params) : undefined;
+					return typeof translated === "string" && translated !== "" ? translated : fallback;
+				} catch {
+					return fallback;
+				}
+			};
+			const label = read(`project.mode.${id}.label`, PROJECT_MODE_FALLBACKS[id]);
+			const count = clampIntervalTurns(intervalTurns) ?? POLICY_DEFAULTS.interval_turns;
+			return {
+				id,
+				label,
+				hint: read(`project.mode.${id}.hint`, ""),
+				buttonLabel: id === "interval" ? `${label} · ${String(count)}` : label,
+			};
+		}
+
+		/**
+		 * One line describing what will actually happen in this project now.
+		 * @param effective - resolved policy the trigger engine will use.
+		 * @param t - locale function.
+		 * @returns a human sentence, or "" when the policy is unusable.
+		 */
+		function describeEffectivePolicy(effective, t) {
+			const value = normalizePolicyValue(effective);
+			const read = (key, fallback) => {
+				try {
+					const translated = typeof t === "function" ? t(key) : undefined;
+					return typeof translated === "string" && translated !== "" ? translated : fallback;
+				} catch {
+					return fallback;
+				}
+			};
+			if (value.trigger === "off") return read("project.effective.off", "Nothing is saved automatically");
+			const when = read(`policy.trigger.${value.trigger}.label`, value.trigger);
+			const how = read(`policy.apply.${value.apply}.label`, value.apply);
+			const cadence = value.trigger === "interval_turns" ? ` · ${String(value.interval_turns)}` : "";
+			return `${when}${cadence} · ${how}`;
 		}
 
 		/**
@@ -406,6 +520,153 @@ window.__ModuleLoader__.load({
 
 		/** Shared policy store: one per browser tab, like the badge snapshot store. */
 		const policyStore = createPolicyStore();
+
+		/**
+		 * The project's own preset: read once per viewed session, then written
+		 * through the host route.
+		 *
+		 * This is a separate store from the settings card on purpose. The card
+		 * edits the profile-wide default, which every project inherits; this one
+		 * edits one repository's file, and the two can disagree — that difference
+		 * is exactly what the menu has to explain.
+		 * @returns store facade over a private per-session map.
+		 */
+		function createProjectPolicyStore() {
+			/** @type {Map<string, { status: string, policy: object | null, error: string | null, saving: boolean, inFlight: Promise<void> | null, listeners: Set<Function> }>} */
+			const records = new Map();
+
+			function recordOf(sessionId) {
+				const key = String(sessionId);
+				let record = records.get(key);
+				if (record === undefined) {
+					record = { status: "loading", policy: null, error: null, saving: false, inFlight: null, listeners: new Set() };
+					records.set(key, record);
+				}
+				return record;
+			}
+
+			function stateOf(record) {
+				return { status: record.status, policy: record.policy, error: record.error, saving: record.saving };
+			}
+
+			function publish(record) {
+				const state = stateOf(record);
+				for (const listener of [ ...record.listeners ]) {
+					try {
+						listener(state);
+					} catch (error) {
+						console.error("dsh-plugin-agent-checkpoint: project policy listener failed", error);
+					}
+				}
+			}
+
+			function adopt(record, body) {
+				const policy = normalizeProjectPolicy(body);
+				if (policy === null) {
+					// A host without this route (or a proxy answering HTML) leaves the
+					// button hidden: guessing a mode would misreport the project.
+					record.status = "unavailable";
+					record.error = body !== null && typeof body === "object" && typeof body.message === "string" ? body.message : null;
+					record.policy = null;
+					return;
+				}
+				record.status = "ready";
+				record.policy = policy;
+				record.error = null;
+			}
+
+			function refresh(sessionId) {
+				const record = recordOf(sessionId);
+				if (record.inFlight !== null) return record.inFlight;
+				const request = fetch(projectPolicyUrl(sessionId), {
+					headers: { accept: "application/json" },
+					credentials: "same-origin",
+					cache: "no-store",
+				})
+					.then((response) => response.json())
+					.then((body) => {
+						adopt(record, body);
+						publish(record);
+					})
+					.catch((error) => {
+						record.status = "unavailable";
+						record.error = error instanceof Error ? error.message : String(error);
+					})
+					.finally(() => {
+						record.inFlight = null;
+					});
+				record.inFlight = request;
+				return request;
+			}
+
+			/**
+			 * Persist one preset.
+			 *
+			 * The local state is published first so the menu closes on the choice
+			 * the operator just made; the answer then replaces it, and a rejection
+			 * rolls the whole record back to what the project file really says.
+			 * @param sessionId - viewed session, naming the project to write.
+			 * @param mode - preset to store.
+			 * @param intervalTurns - cadence to store alongside it.
+			 * @returns the route's parsed body.
+			 */
+			function set(sessionId, mode, intervalTurns) {
+				const record = recordOf(sessionId);
+				const previous = record.policy;
+				const interval = clampIntervalTurns(intervalTurns);
+				if (record.policy !== null) {
+					record.policy = { ...record.policy, mode, intervalTurns: interval === null ? record.policy.intervalTurns : interval, overrides: mode !== PROJECT_DEFAULT_MODE };
+					record.saving = true;
+					publish(record);
+				}
+				return fetch(projectPolicyUrl(sessionId), {
+					method: "POST",
+					headers: { accept: "application/json", "content-type": "application/json" },
+					credentials: "same-origin",
+					cache: "no-store",
+					body: JSON.stringify({ mode, intervalTurns: interval === null ? undefined : interval }),
+				})
+					.then((response) => response.json().catch(() => null).then((body) => ({ response, body })))
+					.then(({ response, body }) => {
+						if (!response.ok || normalizeProjectPolicy(body) === null) {
+							const message = body !== null && typeof body === "object" && typeof body.message === "string" ? body.message : `HTTP ${String(response.status)}`;
+							throw new Error(message);
+						}
+						record.saving = false;
+						adopt(record, body);
+						publish(record);
+						return body;
+					})
+					.catch((error) => {
+						record.saving = false;
+						record.policy = previous;
+						record.error = error instanceof Error ? error.message : String(error);
+						publish(record);
+						throw error;
+					});
+			}
+
+			return {
+				peek(sessionId) {
+					const record = records.get(String(sessionId));
+					return record === undefined ? { status: "loading", policy: null, error: null, saving: false } : stateOf(record);
+				},
+				subscribe(sessionId, listener) {
+					const record = recordOf(sessionId);
+					record.listeners.add(listener);
+					if (record.policy !== null || record.status !== "loading") listener(stateOf(record));
+					void refresh(sessionId);
+					return () => {
+						record.listeners.delete(listener);
+					};
+				},
+				refresh,
+				set,
+			};
+		}
+
+		/** Shared project-policy store: one per browser tab. */
+		const projectStore = createProjectPolicyStore();
 		//#endregion
 
 		//#region snapshot store
@@ -556,7 +817,7 @@ window.__ModuleLoader__.load({
 			"init.running": "Enabling checkpoints…",
 			"init.failed": "Setup failed — click to retry",
 			"policy.name": "Automatic checkpoints",
-			"policy.desc": "Choose when the assistant saves your progress by itself. Saves are drafts by default — nothing is committed until you say so.",
+			"policy.desc": "The default for every project. Each project can override it from the mode button at the top of its conversation. Saves are drafts by default — nothing is committed until you say so.",
 			"policy.trigger.off.label": "Off",
 			"policy.trigger.off.hint": "Nothing is created automatically. Ask the assistant to save when you want a checkpoint.",
 			"policy.trigger.file_change.label": "Whenever files change",
@@ -578,6 +839,33 @@ window.__ModuleLoader__.load({
 			"policy.unavailable": "This DSH build does not expose settings, so automatic checkpoints are unavailable.",
 			"policy.readonly": "These settings are locked by the host configuration.",
 			"policy.saved": "Saved",
+			"project.title": "Checkpoint mode",
+			"project.desc": "How this project saves on its own. The choice lives in the project, so it can travel with the repository.",
+			"project.button.aria": "Checkpoint mode for this project: {{mode}}. Click to change it.",
+			"project.now": "Right now: {{summary}}",
+			"project.source.project": "set by this project",
+			"project.source.settings": "inherited from Settings",
+			"project.interval.label": "Every",
+			"project.interval.unit": "replies",
+			"project.saving": "Saving…",
+			"project.failed": "Could not save — reopen to retry",
+			"project.loading": "Reading this project…",
+			"project.note": "Stored in this project only, so other projects keep their own mode.",
+			"project.effective.off": "Nothing is saved automatically",
+			"project.mode.inherit.label": "Follow Settings",
+			"project.mode.inherit.hint": "Use the default chosen in Settings. Pick this to stop overriding it.",
+			"project.mode.off.label": "Off",
+			"project.mode.off.hint": "Never save by itself here. Ask the assistant when you want a checkpoint.",
+			"project.mode.draft_on_change.label": "Draft when files change",
+			"project.mode.draft_on_change.hint": "After a reply that changed files, keep a draft you can review.",
+			"project.mode.draft_each_turn.label": "Draft after every reply",
+			"project.mode.draft_each_turn.hint": "Every reply leaves a draft, even when no file changed.",
+			"project.mode.commit_on_change.label": "Commit when files change",
+			"project.mode.commit_on_change.hint": "After a reply that changed files, write a real git commit.",
+			"project.mode.commit_each_turn.label": "Commit after every reply",
+			"project.mode.commit_each_turn.hint": "Every reply adds a git commit in this project.",
+			"project.mode.interval.label": "Every few replies",
+			"project.mode.interval.hint": "Save a draft every N replies, for example every 5.",
 		};
 		const zh = {
 			"commit.aria": "工作区当前提交：{{short}}，点击复制完整哈希",
@@ -594,7 +882,7 @@ window.__ModuleLoader__.load({
 			"init.running": "正在启用检查点…",
 			"init.failed": "启用失败，点击重试",
 			"policy.name": "自动检查点",
-			"policy.desc": "选什么时候让助手自动帮你保存进度。默认只存草稿，不确认就不会提交到 git。",
+			"policy.desc": "这里是所有项目的默认值；每个项目可以在对话顶部的模式按钮里单独覆盖。默认只存草稿，不确认就不会提交到 git。",
 			"policy.trigger.off.label": "关闭",
 			"policy.trigger.off.hint": "不自动创建。需要时说一句「保存一下」即可。",
 			"policy.trigger.file_change.label": "改了文件就保存",
@@ -616,6 +904,33 @@ window.__ModuleLoader__.load({
 			"policy.unavailable": "这个 DSH 版本没有提供设置服务，自动检查点暂不可用。",
 			"policy.readonly": "这些设置被宿主配置锁定，暂时不能修改。",
 			"policy.saved": "已保存",
+			"project.title": "检查点模式",
+			"project.desc": "这个项目自己怎么保存。选择记在项目里，可以跟着仓库一起走。",
+			"project.button.aria": "本项目的检查点模式：{{mode}}，点击修改",
+			"project.now": "当前生效：{{summary}}",
+			"project.source.project": "本项目自己设置",
+			"project.source.settings": "沿用设置里的默认",
+			"project.interval.label": "每",
+			"project.interval.unit": "条回复",
+			"project.saving": "正在保存…",
+			"project.failed": "保存失败，重新打开菜单可再试",
+			"project.loading": "正在读取本项目…",
+			"project.note": "只存在这个项目里，别的项目还是各自的模式。",
+			"project.effective.off": "不自动保存",
+			"project.mode.inherit.label": "跟随设置",
+			"project.mode.inherit.hint": "用设置里的默认值；选它就不再单独覆盖。",
+			"project.mode.off.label": "关闭",
+			"project.mode.off.hint": "这个项目里从不自动保存，需要时直接让助手存一份。",
+			"project.mode.draft_on_change.label": "改文件后存草稿",
+			"project.mode.draft_on_change.hint": "哪一轮改了文件，就留一份草稿等你确认。",
+			"project.mode.draft_each_turn.label": "每条回复都存草稿",
+			"project.mode.draft_each_turn.hint": "每条回复都留一份草稿，没改文件也存。",
+			"project.mode.commit_on_change.label": "改文件后直接提交",
+			"project.mode.commit_on_change.hint": "哪一轮改了文件，就直接写一条 git 提交。",
+			"project.mode.commit_each_turn.label": "每条回复都提交",
+			"project.mode.commit_each_turn.hint": "每条回复都在这个项目里加一条 git 提交。",
+			"project.mode.interval.label": "每隔几条回复",
+			"project.mode.interval.hint": "每 N 条回复存一次草稿，比如 5。",
 		};
 		//#endregion
 
@@ -1045,6 +1360,257 @@ window.__ModuleLoader__.load({
 		}
 		//#endregion
 
+		//#region project policy menu
+		const POPOVER_WIDTH = 336;
+		const POLICY_BUTTON_STYLE = {
+			...BUTTON_STYLE,
+			fontFamily: "inherit",
+			fontSize: "11.5px",
+			padding: "0 8px",
+			height: "22px",
+			opacity: "0.78",
+			gap: "4px",
+		};
+		const POPOVER_STYLE = {
+			position: "fixed",
+			zIndex: "90",
+			width: `${String(POPOVER_WIDTH)}px`,
+			maxHeight: "70vh",
+			overflowY: "auto",
+			padding: "12px 14px",
+			borderRadius: "10px",
+			border: "1px solid rgba(127, 127, 127, 0.35)",
+			background: "Canvas",
+			color: "CanvasText",
+			boxShadow: "0 14px 34px rgba(0, 0, 0, 0.24)",
+			textAlign: "left",
+			font: "inherit",
+			fontSize: "12.5px",
+			cursor: "default",
+		};
+		const POPOVER_HEAD_STYLE = { display: "flex", alignItems: "center", justifyContent: "space-between", gap: "8px" };
+		const POPOVER_TITLE_STYLE = { fontSize: "13px", lineHeight: "18px", fontWeight: "600" };
+		const POPOVER_CLOSE_STYLE = {
+			border: "0",
+			background: "transparent",
+			color: "inherit",
+			opacity: "0.55",
+			cursor: "pointer",
+			fontSize: "13px",
+			lineHeight: "18px",
+			padding: "0 2px",
+			fontFamily: "inherit",
+		};
+		const POPOVER_DESC_STYLE = { fontSize: "11.5px", lineHeight: "16px", opacity: "0.62", margin: "4px 0 8px" };
+		const POPOVER_NOW_STYLE = {
+			fontSize: "11.5px",
+			lineHeight: "16px",
+			margin: "10px 0 0",
+			padding: "6px 8px",
+			borderRadius: "6px",
+			background: "rgba(127, 127, 127, 0.14)",
+		};
+		const POPOVER_SOURCE_STYLE = { opacity: "0.6" };
+		const POPOVER_NOTE_STYLE = { fontSize: "11px", lineHeight: "15px", opacity: "0.55", margin: "8px 0 0" };
+		const POPOVER_ERROR_STYLE = { fontSize: "11.5px", lineHeight: "16px", color: "#d9534f", margin: "8px 0 0" };
+
+		/**
+		 * Subscribe to one project's mode.
+		 * @param sessionId - viewed session, or null when the slot has no session.
+		 * @returns latest project policy state.
+		 */
+		function useProjectPolicy(sessionId) {
+			const [ state, setState ] = React.useState(() => (sessionId === null ? { status: "unavailable", policy: null, error: null, saving: false } : projectStore.peek(sessionId)));
+			React.useEffect(() => {
+				if (sessionId === null) return undefined;
+				return projectStore.subscribe(sessionId, setState);
+			}, [ sessionId ]);
+			return state;
+		}
+
+		/**
+		 * The project's own mode, reachable from the conversation header.
+		 *
+		 * Mounted on `conversation.session.header.actions`, which hands every entry
+		 * the viewed session id — the session is what names the project, so the
+		 * button never has to guess which repository it is looking at. The menu is
+		 * a real dialog-like popover rather than a settings route because choosing
+		 * a mode is a per-project decision made while reading that project.
+		 * @param props - `sessionId` from the slot plus the locale function `t`.
+		 * @returns the button and, while open, its menu.
+		 */
+		function ProjectPolicyButton(props) {
+			const sessionId = typeof props.sessionId === "string" && props.sessionId !== "" ? props.sessionId : null;
+			const t = props.t;
+			const state = useProjectPolicy(sessionId);
+			const [ open, setOpen ] = React.useState(false);
+			const [ anchor, setAnchor ] = React.useState(null);
+			const wrapRef = React.useRef(null);
+			const text = (key, fallback, params) => {
+				let template = fallback;
+				try {
+					const translated = typeof t === "function" ? t(key, params) : undefined;
+					if (typeof translated === "string" && translated !== "") template = translated;
+				} catch {
+					template = fallback;
+				}
+				if (typeof template !== "string") template = "";
+				if (params !== undefined && typeof template === "string") {
+					for (const name of Object.keys(params)) template = template.split(`{{${name}}}`).join(String(params[name]));
+				}
+				return template;
+			};
+
+			// A fixed-position menu escapes the header's own overflow rules, so it has
+			// to be re-measured when the window or the layout moves under it.
+			React.useEffect(() => {
+				if (!open) return undefined;
+				const measure = () => {
+					const node = wrapRef.current;
+					if (node === null || typeof node !== "object" || typeof node.getBoundingClientRect !== "function") return;
+					setAnchor(node.getBoundingClientRect());
+				};
+				measure();
+				const onPointerDown = (event) => {
+					const node = wrapRef.current;
+					if (node !== null && typeof node === "object" && typeof node.contains === "function" && node.contains(event.target) === true) return;
+					setOpen(false);
+				};
+				const onKeyDown = (event) => {
+					if (event.key === "Escape") setOpen(false);
+				};
+				document.addEventListener("mousedown", onPointerDown);
+				document.addEventListener("keydown", onKeyDown);
+				window.addEventListener("resize", measure);
+				window.addEventListener("scroll", measure, true);
+				return () => {
+					document.removeEventListener("mousedown", onPointerDown);
+					document.removeEventListener("keydown", onKeyDown);
+					window.removeEventListener("resize", measure);
+					window.removeEventListener("scroll", measure, true);
+				};
+			}, [ open ]);
+
+			if (sessionId === null || state.status === "unavailable") return null;
+			if (state.status !== "ready" || state.policy === null) {
+				return React.createElement(
+					"span",
+					{ style: { ...RUNNING_STYLE, fontSize: "11.5px" }, className: "dsh-agent-checkpoint-policy is-loading", "data-agent-checkpoint-policy": "loading" },
+					text("project.loading", "Reading this project…"),
+				);
+			}
+
+			const policy = state.policy;
+			const mode = describeProjectMode(policy.mode, t, policy.intervalTurns);
+			const summary = describeEffectivePolicy(policy.effective, t);
+			const source = text(policy.effectiveFrom === "project" ? "project.source.project" : "project.source.settings", "");
+			const saving = state.saving === true;
+			const choose = (id) => {
+				if (saving) return;
+				projectStore.set(sessionId, id, policy.intervalTurns).catch(() => {});
+			};
+			const closeButton = React.createElement(
+				"button",
+				{ type: "button", style: POPOVER_CLOSE_STYLE, "aria-label": text("init.cancel", "Close"), onClick: () => setOpen(false) },
+				"✕",
+			);
+			const modeRows = PROJECT_MODES.map((id) =>
+				choiceRow(
+					`project-mode-${id}`,
+					text(`project.mode.${id}.label`, PROJECT_MODE_FALLBACKS[id]),
+					text(`project.mode.${id}.hint`, ""),
+					policy.mode === id,
+					saving,
+					() => choose(id),
+				),
+			);
+			const intervalRow = policy.mode === "interval" || saving
+				? React.createElement(
+					"div",
+					{ key: "project-interval", style: { ...CARD_ROW_STYLE, cursor: "default", paddingLeft: "22px", opacity: policy.mode === "interval" ? "1" : "0.45" } },
+					React.createElement("span", { style: ROW_LABEL_STYLE }, text("project.interval.label", "Every")),
+					React.createElement("input", {
+						type: "number",
+						min: String(INTERVAL_MIN),
+						max: String(INTERVAL_MAX),
+						step: "1",
+						value: String(policy.intervalTurns),
+						style: NUMBER_STYLE,
+						disabled: saving || policy.mode !== "interval",
+						"aria-label": text("project.mode.interval.label", "Every few replies"),
+						"data-agent-checkpoint-project-interval": String(policy.intervalTurns),
+						onChange: (event) => {
+							const next = clampIntervalTurns(event.target.value);
+							if (next === null || saving) return;
+							projectStore.set(sessionId, policy.mode, next).catch(() => {});
+						},
+					}),
+					React.createElement("span", { style: ROW_HINT_STYLE }, text("project.interval.unit", "replies")),
+				)
+				: null;
+
+			const viewportWidth = typeof window === "object" && window !== null && typeof window.innerWidth === "number" ? window.innerWidth : POPOVER_WIDTH + 16;
+			const menu = open
+				? React.createElement(
+					"div",
+					{
+						role: "dialog",
+						"aria-label": text("project.title", "Checkpoint mode"),
+						className: "dsh-agent-checkpoint-policy-menu",
+						style: {
+							...POPOVER_STYLE,
+							top: anchor !== null ? `${String(Math.round(anchor.bottom + 6))}px` : "0px",
+							left: anchor !== null ? `${String(Math.round(Math.max(8, Math.min(anchor.left, viewportWidth - POPOVER_WIDTH - 8))))}px` : "0px",
+							visibility: anchor !== null ? "visible" : "hidden",
+						},
+					},
+					React.createElement(
+						"div",
+						{ style: POPOVER_HEAD_STYLE },
+						React.createElement("div", { style: POPOVER_TITLE_STYLE }, text("project.title", "Checkpoint mode")),
+						closeButton,
+					),
+					React.createElement("p", { style: POPOVER_DESC_STYLE }, text("project.desc", "")),
+					React.createElement("div", { role: "radiogroup", "aria-label": text("project.title", "Checkpoint mode") }, modeRows, intervalRow),
+					React.createElement(
+						"p",
+						{ style: POPOVER_NOW_STYLE },
+						text("project.now", null, { summary }),
+						" ",
+						React.createElement("span", { style: POPOVER_SOURCE_STYLE }, `(${source})`),
+					),
+					React.createElement("p", { style: POPOVER_NOTE_STYLE }, `${text("project.note", "")}${policy.configPath !== null ? ` ${policy.configPath}` : ""}`),
+					state.error !== null && state.error !== undefined
+						? React.createElement("p", { style: POPOVER_ERROR_STYLE }, `${text("project.failed", "Could not save")} (${state.error})`)
+						: null,
+				)
+				: null;
+
+			return React.createElement(
+				"span",
+				{ ref: wrapRef, style: { position: "relative", display: "inline-flex", alignItems: "center" } },
+				React.createElement(
+					"button",
+					{
+						type: "button",
+						style: POLICY_BUTTON_STYLE,
+						className: "dsh-agent-checkpoint-policy-button",
+						"data-agent-checkpoint-policy-button": policy.mode,
+						"data-agent-checkpoint-policy-source": policy.effectiveFrom,
+						"aria-haspopup": "true",
+						"aria-expanded": open ? "true" : "false",
+						title: saving ? text("project.saving", "Saving…") : `${mode.hint}\n${text("project.now", null, { summary })}`,
+						"aria-label": text("project.button.aria", `Checkpoint mode for this project: ${mode.label}. Click to change it.`, { mode: mode.label }),
+						onClick: () => setOpen((value) => value !== true),
+					},
+					React.createElement("span", { style: FLAG_STYLE }, "⚑"),
+					React.createElement("span", null, saving ? text("project.saving", "Saving…") : mode.buttonLabel),
+				),
+				menu,
+			);
+		}
+		//#endregion
+
 		//#region plugin
 		/** The slot registry and the copy service are the only dependencies. */
 		const inject = [ "slots", "locale" ];
@@ -1055,6 +1621,15 @@ window.__ModuleLoader__.load({
 		 */
 		function apply(ctx) {
 			ctx.effect(() => ctx.locale.register(NS, { en, zh }), "agent-checkpoint: dictionaries");
+			// The per-project mode lives in the conversation header: the project is only
+			// unambiguous while looking at a session, and the slot hands us that id.
+			ctx.slots.inject("conversation.session.header.actions", () => ctx.slots.register({
+				name: "conversation.session.header.actions",
+				id: "agent-checkpoint-policy",
+				order: 30,
+				locale: NS,
+				inject: (sessionId) => ({ sessionId }),
+			}, ProjectPolicyButton));
 			ctx.slots.inject("conversation.chat.assistant-actions", () => ctx.slots.register({
 				name: "conversation.chat.assistant-actions",
 				id: "agent-checkpoint-commit",
@@ -1094,6 +1669,14 @@ window.__ModuleLoader__.load({
 		exports.initUrl = initUrl;
 		exports.createStore = createStore;
 		exports.PolicyCard = PolicyCard;
+		exports.ProjectPolicyButton = ProjectPolicyButton;
+		exports.createProjectPolicyStore = createProjectPolicyStore;
+		exports.projectPolicyUrl = projectPolicyUrl;
+		exports.normalizeProjectPolicy = normalizeProjectPolicy;
+		exports.describeProjectMode = describeProjectMode;
+		exports.describeEffectivePolicy = describeEffectivePolicy;
+		exports.PROJECT_MODES = PROJECT_MODES;
+		exports.PROJECT_DEFAULT_MODE = PROJECT_DEFAULT_MODE;
 		exports.createPolicyStore = createPolicyStore;
 		exports.policyStateOf = policyStateOf;
 		exports.clampIntervalTurns = clampIntervalTurns;
