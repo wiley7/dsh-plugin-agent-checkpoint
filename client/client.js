@@ -124,12 +124,118 @@ window.__ModuleLoader__.load({
 		 */
 		function describeWorkspace(raw) {
 			const model = describeCommit(raw);
-			if (model !== null) return { kind: "commit", model };
+			if (model !== null) return { kind: "commit", model, snapshot: normalizeSnapshot(raw) };
 			if (raw === null || typeof raw !== "object" || Array.isArray(raw)) return { kind: "none" };
 			if (raw.ok === false && raw.error === "not_a_git_repo" && raw.source === "session" && typeof raw.workspace === "string" && raw.workspace !== "") {
 				return { kind: "init", workspace: raw.workspace };
 			}
 			return { kind: "none" };
+		}
+
+		/**
+		 * Pick the attribution entry the host computed for one assistant message.
+		 *
+		 * Each reply is attributed to the checkpoint that was current *when it was
+		 * written*, so an old reply keeps naming the old snapshot instead of
+		 * silently claiming the newest commit.
+		 * @param snapshot - normalized snapshot, or null before the first fetch.
+		 * @param messageId - id the chat slot hands to this seat.
+		 * @returns the matching entry, or null when the host knows no such message.
+		 */
+		function attributeMessage(snapshot, messageId) {
+			const normalized = normalizeSnapshot(snapshot);
+			if (normalized === null) return null;
+			if (typeof messageId !== "string" || messageId === "") return null;
+			const list = Array.isArray(normalized.attribution) ? normalized.attribution : [];
+			for (const entry of list) {
+				if (entry === null || typeof entry !== "object") continue;
+				if (entry.messageId !== messageId) continue;
+				return entry;
+			}
+			return null;
+		}
+
+		/**
+		 * Fold one message's attribution into the strings the badge renders.
+		 * @param snapshot - normalized snapshot, or null.
+		 * @param messageId - id of the reply this seat belongs to.
+		 * @returns display model, or null when this reply has no checkpoint.
+		 */
+		function describeMessageCheckpoint(snapshot, messageId) {
+			const entry = attributeMessage(snapshot, messageId);
+			if (entry === null) return null;
+			const checkpointId = typeof entry.checkpointId === "string" && entry.checkpointId !== "" ? entry.checkpointId : null;
+			// A reply written before the first snapshot keeps an empty seat: showing
+			// the newest commit here is exactly the bug this seat exists to avoid.
+			if (checkpointId === null) return null;
+			const status = entry.status === "confirmed" ? "confirmed" : "draft";
+			const short = typeof entry.short === "string" && entry.short !== "" ? entry.short : checkpointId.slice(-8);
+			const hash = typeof entry.commitHash === "string" && entry.commitHash !== "" ? entry.commitHash : checkpointId;
+			const titleParts = [ `checkpoint: ${checkpointId}`, status === "confirmed" ? "confirmed snapshot" : "draft snapshot, not committed yet" ];
+			if (typeof entry.title === "string" && entry.title !== "") titleParts.push(entry.title);
+			if (typeof entry.commitHash === "string" && entry.commitHash !== "") titleParts.push(`commit ${entry.commitHash}`);
+			if (typeof entry.createdAt === "number" && Number.isFinite(entry.createdAt)) titleParts.push(new Date(entry.createdAt).toISOString());
+			if (typeof entry.fromTurn === "number" && Number.isFinite(entry.fromTurn)) titleParts.push(`saved in turn ${entry.fromTurn}`);
+			if (entry.inherited === true) titleParts.push("saved before this reply and still current");
+			return {
+				checkpointId,
+				short,
+				status,
+				hash,
+				title: titleParts.join("\n"),
+				label: `${status === "confirmed" ? "⚑" : "✎"} ${short}`,
+			};
+		}
+
+		/**
+		 * The commit that was HEAD at one instant, taken from the fetched window.
+		 * @param commits - newest-first commit timeline of the snapshot.
+		 * @param at - epoch milliseconds of an assistant message.
+		 * @returns the newest commit committed at or before `at`, or null.
+		 */
+		function commitAt(commits, at) {
+			if (!Array.isArray(commits) || !Number.isFinite(at)) return null;
+			let best = null;
+			let bestAt = -Infinity;
+			for (const commit of commits) {
+				if (commit === null || typeof commit !== "object") continue;
+				const ms = typeof commit.committedAtMs === "number" && Number.isFinite(commit.committedAtMs)
+					? commit.committedAtMs
+					: Date.parse(typeof commit.committedAt === "string" ? commit.committedAt : "");
+				if (!Number.isFinite(ms) || ms > at) continue;
+				if (ms > bestAt) {
+					best = commit;
+					bestAt = ms;
+				}
+			}
+			return best;
+		}
+
+		/**
+		 * What to show under one reply: its checkpoint when it has one, otherwise
+		 * the commit that was HEAD at that moment.
+		 *
+		 * The second case keeps the badge alive in projects that never adopted
+		 * checkpoints, and either way the value is the one from *that* reply's time
+		 * — never today's HEAD.
+		 * @param snapshot - normalized snapshot, or null.
+		 * @param messageId - id of the reply this seat belongs to.
+		 * @returns display model, or null when the reply predates every commit.
+		 */
+		function describeMessageBadge(snapshot, messageId) {
+			const entry = attributeMessage(snapshot, messageId);
+			if (entry === null) return null;
+			const checkpoint = describeMessageCheckpoint(snapshot, messageId);
+			if (checkpoint !== null) return { ...checkpoint, kind: "checkpoint" };
+			const normalized = normalizeSnapshot(snapshot);
+			const commit = normalized === null ? null : commitAt(normalized.commits, entry.at);
+			if (commit === null || typeof commit.hash !== "string" || commit.hash === "") return null;
+			const short = typeof commit.short === "string" && commit.short !== "" ? commit.short : commit.hash.slice(0, 7);
+			const titleParts = [ `commit: ${commit.hash}` ];
+			if (typeof commit.subject === "string" && commit.subject !== "") titleParts.push(commit.subject);
+			if (typeof commit.committedAt === "string" && commit.committedAt !== "") titleParts.push(commit.committedAt);
+			titleParts.push("no checkpoint at this point in the conversation");
+			return { kind: "commit", checkpointId: null, short, status: "commit", hash: commit.hash, title: titleParts.join("\n"), label: short };
 		}
 		//#endregion
 
@@ -426,6 +532,8 @@ window.__ModuleLoader__.load({
 			"commit.aria": "Git commit of the workspace: {{short}}. Click to copy the full hash.",
 			"commit.dirty": "uncommitted changes",
 			"commit.checkpoint": "confirmed checkpoint",
+			"commit.draft": "draft checkpoint, not committed yet",
+			"commit.message.aria": "Checkpoint saved with this reply: {{short}}. Click to copy the full hash.",
 			"commit.copied": "Commit hash copied",
 			"commit.unavailable": "Workspace is not a git repository",
 			"init.label": "Enable checkpoints",
@@ -462,6 +570,8 @@ window.__ModuleLoader__.load({
 			"commit.aria": "工作区当前提交：{{short}}，点击复制完整哈希",
 			"commit.dirty": "有未提交改动",
 			"commit.checkpoint": "已确认的检查点",
+			"commit.draft": "草稿检查点，尚未提交",
+			"commit.message.aria": "这条回复保存的检查点：{{short}}，点击复制完整哈希",
 			"commit.copied": "已复制提交哈希",
 			"commit.unavailable": "工作区不是 git 仓库",
 			"init.label": "启用检查点",
@@ -522,6 +632,8 @@ window.__ModuleLoader__.load({
 		const MUTED_STYLE = { opacity: "0.7" };
 		const DIRTY_STYLE = { color: "#d97706", fontWeight: "700" };
 		const FLAG_STYLE = { color: "#0ea5e9" };
+		/** Draft snapshots exist only in .dsh-checkpoint, so they read quieter. */
+		const DRAFT_STYLE = { color: "#8b8f96" };
 		/**
 		 * The init control only appears on projects without a repository, so it is
 		 * the quietest thing in the row: dashed hairline, secondary color.
@@ -687,7 +799,15 @@ window.__ModuleLoader__.load({
 				);
 			}
 
-			const model = view.model;
+			// Which checkpoint belongs to *this* reply. Older hosts that do not pass a
+			// message id fall back to the workspace head so the badge keeps working.
+			const messageId = typeof props.messageId === "string" && props.messageId !== "" ? props.messageId : null;
+			const attributed = messageId === null ? null : describeMessageBadge(view.snapshot, messageId);
+			if (messageId !== null && attributed === null) return null;
+			const model = attributed !== null
+				? { short: attributed.short, hash: attributed.hash, title: attributed.title, status: attributed.status === "commit" ? null : attributed.status, label: attributed.label }
+				: { short: view.model.short, hash: view.model.hash, title: view.model.title, status: view.model.checkpoint !== null ? "confirmed" : null, label: view.model.label };
+
 			const copy = () => {
 				const clipboard = typeof navigator !== "undefined" ? navigator.clipboard : undefined;
 				if (clipboard === undefined || typeof clipboard.writeText !== "function") return;
@@ -698,10 +818,12 @@ window.__ModuleLoader__.load({
 			};
 
 			const children = [];
-			if (model.branch !== null) children.push(React.createElement("span", { key: "branch", style: MUTED_STYLE }, `${model.branch} `));
+			if (model.status !== null) {
+				children.push(React.createElement("span", { key: "status", style: model.status === "confirmed" ? FLAG_STYLE : DRAFT_STYLE, title: text(model.status === "confirmed" ? "commit.checkpoint" : "commit.draft", model.status === "confirmed" ? "confirmed checkpoint" : "draft checkpoint") }, model.status === "confirmed" ? "⚑" : "✎"));
+			}
+			if (attributed === null && view.model.branch !== null) children.push(React.createElement("span", { key: "branch", style: MUTED_STYLE }, `${view.model.branch} `));
 			children.push(React.createElement("span", { key: "hash", style: HASH_STYLE }, model.short));
-			if (model.dirty) children.push(React.createElement("span", { key: "dirty", style: DIRTY_STYLE }, "*"));
-			if (model.checkpoint !== null) children.push(React.createElement("span", { key: "checkpoint", style: FLAG_STYLE, title: text("commit.checkpoint", "confirmed checkpoint") }, "⚑"));
+			if (attributed === null && view.model.dirty) children.push(React.createElement("span", { key: "dirty", style: DIRTY_STYLE }, "*"));
 
 			return React.createElement(
 				"button",
@@ -710,8 +832,9 @@ window.__ModuleLoader__.load({
 					style: BUTTON_STYLE,
 					className: "dsh-agent-checkpoint-commit",
 					"data-agent-checkpoint-commit": model.short,
-					title: copied ? text("commit.copied", "Commit hash copied") : model.title,
-					"aria-label": text("commit.aria", `Git commit ${model.short}. Click to copy the full hash.`, { short: model.short }),
+					"data-agent-checkpoint-status": model.status ?? "head",
+					title: copied ? text("commit.copied", "Hash copied") : model.title,
+					"aria-label": text("commit.message.aria", `Checkpoint saved with this reply: ${model.short}. Click to copy.`, { short: model.short }),
 					onClick: copy,
 				},
 				children,
@@ -947,6 +1070,10 @@ window.__ModuleLoader__.load({
 		exports.CommitBadge = CommitBadge;
 		exports.describeCommit = describeCommit;
 		exports.describeWorkspace = describeWorkspace;
+		exports.attributeMessage = attributeMessage;
+		exports.describeMessageCheckpoint = describeMessageCheckpoint;
+		exports.describeMessageBadge = describeMessageBadge;
+		exports.commitAt = commitAt;
 		exports.normalizeSnapshot = normalizeSnapshot;
 		exports.badgeUrl = badgeUrl;
 		exports.initUrl = initUrl;

@@ -21,15 +21,21 @@
 
 import { spawn } from 'node:child_process';
 import { createReadStream } from 'node:fs';
-import { readdir, stat } from 'node:fs/promises';
+import { readdir, readFile, stat } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
-import { createZstdDecompress, constants as zlibConstants } from 'node:zlib';
+import { zstdDecompressSync } from 'node:zlib';
 
 import type { ContextMessage, PlanItem, SessionContext, ToolUsage } from './types.js';
 
 /** Maximum bytes of decompressed session text consumed for one capture. */
 const DEFAULT_MAX_READ_BYTES = 8 * 1024 * 1024;
+
+/** Compressed logs larger than this are handed to the `zstd` CLI instead. */
+const MAX_COMPRESSED_READ_BYTES = 64 * 1024 * 1024;
+
+/** zstd frame marker; DSH appends one frame per flush. */
+const ZSTD_MAGIC = Buffer.from([ 0x28, 0xb5, 0x2f, 0xfd ]);
 
 /** Largest number of candidate session directories probed during discovery. */
 const MAX_DISCOVERY_CANDIDATES = 12;
@@ -186,6 +192,51 @@ export async function listSessionFiles(dshHome?: string | null): Promise<Session
   return found;
 }
 
+/**
+ * Decode a DSH session log, which is a *concatenation* of zstd frames.
+ *
+ * DSH appends one frame per flushed write, so a real `session.v4.jsonl.zstd`
+ * holds thousands of them. `node:zlib` decodes only the first frame and ignores
+ * the rest, which would silently reduce a log to its header record. Frames are
+ * therefore split by scanning for the zstd magic bytes and keeping the earliest
+ * candidate boundary that decodes cleanly: a boundary that cuts a frame short
+ * throws, and a later boundary that spans several frames would swallow data, so
+ * the first success is always the true next frame start.
+ */
+function decodeZstdFrames(buffer: Buffer, options: { firstLineOnly?: boolean } = {}): string {
+  const starts: number[] = [];
+  let found = buffer.indexOf(ZSTD_MAGIC, 0);
+  while (found !== -1) {
+    starts.push(found);
+    found = buffer.indexOf(ZSTD_MAGIC, found + ZSTD_MAGIC.length);
+  }
+
+  const parts: Buffer[] = [];
+  let cursor = 0;
+  let index = 0;
+  while (cursor < buffer.length) {
+    while (index < starts.length && starts[index]! <= cursor) index += 1;
+    let advanced = false;
+    for (let k = index; k <= starts.length; k += 1) {
+      const end = k < starts.length ? starts[k]! : buffer.length;
+      let decoded: Buffer;
+      try {
+        decoded = zstdDecompressSync(buffer.subarray(cursor, end));
+      } catch {
+        continue;
+      }
+      parts.push(decoded);
+      cursor = end;
+      index = k;
+      advanced = true;
+      if (options.firstLineOnly && decoded.includes(0x0a)) return Buffer.concat(parts).toString('utf8');
+      break;
+    }
+    if (!advanced) break;
+  }
+  return Buffer.concat(parts).toString('utf8');
+}
+
 /** Read at most `maxBytes` of decompressed text from a (possibly zstd) log. */
 async function readDecompressed(
   file: string,
@@ -195,20 +246,33 @@ async function readDecompressed(
   const maxBytes = options.maxBytes ?? DEFAULT_MAX_READ_BYTES;
   const sink = { text: '', truncated: false };
 
+  // Two different reads live here:
+  //  - firstLineOnly keeps the *head* (the session header record);
+  //  - everything else keeps the *tail*, because a digest is built from the most
+  //    recent turns — capping the head would capture the oldest conversation
+  //    instead of the context that produced the checkpoint.
   const accept = (chunk: string): boolean => {
-    // Returns true when enough data has been gathered.
-    sink.text += chunk;
-    if (options.firstLineOnly && sink.text.includes('\n')) {
+    if (options.firstLineOnly) {
+      sink.text += chunk;
       const newline = sink.text.indexOf('\n');
-      sink.text = sink.text.slice(0, newline);
-      return true;
+      if (newline !== -1) {
+        sink.text = sink.text.slice(0, newline);
+        return true;
+      }
+      if (sink.text.length >= maxBytes) {
+        sink.text = sink.text.slice(0, maxBytes);
+        sink.truncated = true;
+        return true;
+      }
+      return false;
     }
-    if (sink.text.length >= maxBytes) {
-      sink.text = sink.text.slice(0, maxBytes);
+    sink.text += chunk;
+    if (sink.text.length > maxBytes) {
+      sink.text = sink.text.slice(sink.text.length - maxBytes);
       sink.truncated = true;
-      return true;
     }
-    return false;
+    // Bound memory on the streaming path without giving up the newest bytes.
+    return sink.text.length >= maxBytes * 4;
   };
 
   if (!compressed) {
@@ -225,32 +289,23 @@ async function readDecompressed(
     });
   }
 
-  // Preferred path: node's built-in zstd stream (Node >= 23.8). Falls back to
-  // the system `zstd` binary for older runtimes, matching the requirement that
-  // the plugin must not add heavyweight native dependencies.
-  if (typeof createZstdDecompress === 'function') {
+  // Preferred path: node's built-in zstd decoder (Node >= 23.8), applied frame by
+  // frame because a session log is a concatenation of frames. Falls back to the
+  // system `zstd` binary when the runtime has no zstd support, matching the
+  // requirement that the plugin must not add heavyweight native dependencies.
+  if (typeof zstdDecompressSync === 'function') {
+    let decoded: string | null = null;
     try {
-      const decompressor = createZstdDecompress({
-        chunkSize: 256 * 1024,
-        params: { [zlibConstants.ZSTD_d_windowLogMax]: 27 },
-      });
-      const source = createReadStream(file);
-      source.pipe(decompressor);
-      return await new Promise((resolve, reject) => {
-        decompressor.setEncoding('utf8');
-        decompressor.on('data', (chunk: string) => {
-          if (accept(chunk)) {
-            source.destroy();
-            decompressor.destroy();
-            resolve({ text: sink.text, truncated: sink.truncated });
-          }
-        });
-        decompressor.on('end', () => resolve({ text: sink.text, truncated: sink.truncated }));
-        decompressor.on('error', reject);
-        source.on('error', reject);
-      });
+      const info = await stat(file);
+      if (info.size <= MAX_COMPRESSED_READ_BYTES) {
+        decoded = decodeZstdFrames(await readFile(file), { firstLineOnly: options.firstLineOnly });
+      }
     } catch {
-      // fall through to CLI
+      decoded = null;
+    }
+    if (decoded !== null) {
+      accept(decoded);
+      return { text: sink.text, truncated: sink.truncated };
     }
   }
 
@@ -299,6 +354,108 @@ export async function readSessionHeader(file: string): Promise<SessionHeader | n
 
 function normalizePath(value: string): string {
   return path.resolve(value).replace(/\/+$/, '');
+}
+
+/** One turn observed in a session log, with the wall clock it covered. */
+export interface SessionTurnWindow {
+  turn: number;
+  startSeq: number;
+  startAt: number;
+  endSeq: number | null;
+  endAt: number | null;
+}
+
+/** One assistant message, keyed by the id the web UI shows the actions under. */
+export interface SessionMessagePoint {
+  messageId: string;
+  turn: number;
+  seq: number;
+  at: number;
+}
+
+/** Chronology of a session: turns plus the assistant messages inside them. */
+export interface SessionTimeline {
+  sessionId: string | null;
+  cwd: string | null;
+  turns: SessionTurnWindow[];
+  messages: SessionMessagePoint[];
+  eventCount: number;
+}
+
+/** Largest single record parsed while reading a timeline (token streams exceed this). */
+const MAX_TIMELINE_RECORD_BYTES = 4 * 1024 * 1024;
+
+/**
+ * Timeline reads keep the whole log, not just its tail: the badge must be able to
+ * say what was current during the *first* reply of a session too, and a truncated
+ * head would silently attribute those old replies to a newer snapshot.
+ */
+const TIMELINE_MAX_READ_BYTES = 64 * 1024 * 1024;
+
+/**
+ * Project a session log onto the chronology the browser needs: which turn each
+ * assistant message belongs to, and when that turn happened. Everything else
+ * (token streams, tool payloads, context blocks) is deliberately dropped.
+ */
+export function digestTimeline(lines: string[]): SessionTimeline {
+  const timeline: SessionTimeline = { sessionId: null, cwd: null, turns: [], messages: [], eventCount: 0 };
+  const windows = new Map<number, SessionTurnWindow>();
+  let currentTurn: number | null = null;
+
+  for (const line of lines) {
+    if (line.trim() === '') continue;
+    if (line.length > MAX_TIMELINE_RECORD_BYTES) continue;
+    let record: Record<string, unknown>;
+    try {
+      record = JSON.parse(line) as Record<string, unknown>;
+    } catch {
+      continue;
+    }
+    const type = typeof record.type === 'string' ? record.type : '';
+    if (type === 'session') {
+      if (typeof record.id === 'string') timeline.sessionId = record.id;
+      if (typeof record.cwd === 'string') timeline.cwd = record.cwd;
+      continue;
+    }
+    timeline.eventCount += 1;
+    if (type !== 'turn/start' && type !== 'turn/end' && type !== 'assistant/message') continue;
+    const seq = typeof record.seq === 'number' ? record.seq : null;
+    const at = typeof record.time === 'number' ? record.time : null;
+    if (seq === null || at === null) continue;
+    const data = record.data !== null && typeof record.data === 'object' ? (record.data as Record<string, unknown>) : {};
+    const turn: number | null = typeof data.turn === 'number' ? data.turn : currentTurn;
+    if (turn === null) continue;
+    currentTurn = turn;
+
+    if (type === 'turn/start') {
+      windows.set(turn, { turn, startSeq: seq, startAt: at, endSeq: null, endAt: null });
+      continue;
+    }
+    if (type === 'turn/end') {
+      const window = windows.get(turn) ?? { turn, startSeq: seq, startAt: at, endSeq: null, endAt: null };
+      window.endSeq = seq;
+      window.endAt = at;
+      windows.set(turn, window);
+      continue;
+    }
+    const message = data.message !== null && typeof data.message === 'object' ? (data.message as Record<string, unknown>) : {};
+    if (typeof message.id !== 'string' || message.id === '') continue;
+    timeline.messages.push({ messageId: message.id, turn, seq, at });
+  }
+
+  timeline.turns = [ ...windows.values() ].sort((left, right) => left.startAt - right.startAt || left.turn - right.turn);
+  timeline.messages.sort((left, right) => left.seq - right.seq);
+  return timeline;
+}
+
+/** Read and project the chronology of one session log. */
+export async function readSessionTimeline(options: { file: string; maxBytes?: number }): Promise<SessionTimeline> {
+  const parsed = parseVersion(options.file);
+  if (!parsed) return { sessionId: null, cwd: null, turns: [], messages: [], eventCount: 0 };
+  const { text } = await readDecompressed(options.file, parsed.compressed, {
+    maxBytes: options.maxBytes ?? TIMELINE_MAX_READ_BYTES,
+  });
+  return digestTimeline(text.split('\n'));
 }
 
 /**

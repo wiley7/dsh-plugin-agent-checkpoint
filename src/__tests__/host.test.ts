@@ -295,6 +295,114 @@ describe('buildGitSnapshot', () => {
   });
 });
 
+describe('per-message checkpoint attribution', () => {
+  /** Three turns, one checkpoint after turn 1 and one after turn 2. */
+  const T = { t1s: 1_700_000_000_000, t1m: 1_700_000_060_000, t1e: 1_700_000_120_000 };
+
+  /** Write a three-turn session log and return its path. */
+  async function writeTimelineLog(dshHome: string, sessionId: string, cwd: string): Promise<string> {
+    const dir = path.join(dshHome, 'sessions', '--tmp--', `session-${sessionId}`);
+    await mkdir(dir, { recursive: true });
+    const file = path.join(dir, 'session.v4.jsonl.zstd');
+    const first = T.t1s;
+    const second = first + 1_000_000;
+    const third = second + 1_000_000;
+    const events = [
+      { type: 'session', version: 4, id: sessionId, cwd, agentPreset: 'planner' },
+      { type: 'turn/start', seq: 4, time: first, data: { turn: 1 } },
+      { type: 'assistant/message', seq: 16, time: first + 60_000, data: { turn: 1, message: { id: 'msg-1', content: [ { type: 'text', text: 'scaffolded' } ] } } },
+      { type: 'turn/end', seq: 23, time: first + 120_000, data: { turn: 1 } },
+      { type: 'turn/start', seq: 27, time: second, data: { turn: 2 } },
+      { type: 'assistant/message', seq: 30, time: second + 60_000, data: { turn: 2, message: { id: 'msg-2', content: [ { type: 'text', text: 'wrote tests' } ] } } },
+      { type: 'turn/end', seq: 40, time: second + 120_000, data: { turn: 2 } },
+      // A quiet third round that produced no snapshot of its own.
+      { type: 'turn/start', seq: 44, time: third, data: { turn: 3 } },
+      { type: 'assistant/message', seq: 46, time: third + 60_000, data: { turn: 3, message: { id: 'msg-3', content: [ { type: 'text', text: 'answered a question' } ] } } },
+      { type: 'turn/end', seq: 50, time: third + 120_000, data: { turn: 3 } },
+    ];
+    await writeFile(file, zstdCompressSync(Buffer.from(toJsonl(events), 'utf8')));
+    return file;
+  }
+
+  /** Store one checkpoint record, the way the MCP tools would. */
+  async function storeCheckpoint(
+    workspacePath: string,
+    kind: 'drafts' | 'checkpoints',
+    record: { id: string; title: string; createdAt: number; commitHash: string | null },
+  ): Promise<void> {
+    const dir = path.join(workspacePath, '.dsh-checkpoint', kind);
+    await mkdir(dir, { recursive: true });
+    await writeFile(
+      path.join(dir, `${record.id}.json`),
+      JSON.stringify({
+        id: record.id,
+        status: kind === 'drafts' ? 'draft' : 'confirmed',
+        title: record.title,
+        tags: [],
+        remark: '',
+        createdAt: new Date(record.createdAt).toISOString(),
+        updatedAt: new Date(record.createdAt).toISOString(),
+        workspace: workspacePath,
+        branch: 'main',
+        commitHash: record.commitHash,
+      }),
+    );
+  }
+
+  it('names the snapshot that was current for each reply, never a later one', async () => {
+    const workspace = await makeWorkspace('ckpt-attribution-');
+    try {
+      await runGit(workspace.dir, [ 'init', '--initial-branch=main' ]);
+      await configureIdentity(workspace.dir);
+      await writeWorkspaceFile(workspace.dir, 'app.ts', 'export const x = 1;\n');
+      await commitAll(workspace.dir, 'initial import');
+      const sessionFile = await writeTimelineLog(workspace.dshHome, 'session-attribution', workspace.dir);
+      // Snapshot of turn 1 (still a draft) and of turn 2 (committed).
+      await storeCheckpoint(workspace.dir, 'drafts', { id: 'draft-1700000120001-aaaa1111', title: 'Scaffold', createdAt: T.t1e + 1_000, commitHash: null });
+      await storeCheckpoint(workspace.dir, 'checkpoints', { id: 'ckpt-1700001120001-bbbb2222', title: 'Tests', createdAt: T.t1e + 1_001_000, commitHash: 'deadbeef' });
+
+      const snapshot = await buildGitSnapshot(workspace.dir, { sessionFile });
+      const attribution = snapshot.attribution;
+      assert.equal(attribution.length, 3);
+
+      const first = attribution.find((entry) => entry.messageId === 'msg-1')!;
+      assert.equal(first.checkpointId, 'draft-1700000120001-aaaa1111');
+      assert.equal(first.status, 'draft');
+      assert.equal(first.short, 'aaaa1111');
+      assert.equal(first.inherited, false);
+      assert.equal(first.fromTurn, 1);
+
+      const second = attribution.find((entry) => entry.messageId === 'msg-2')!;
+      assert.equal(second.checkpointId, 'ckpt-1700001120001-bbbb2222');
+      assert.equal(second.status, 'confirmed');
+      assert.equal(second.commitHash, 'deadbeef');
+      assert.equal(second.inherited, false);
+
+      // Turn 3 saved nothing, so its reply keeps reporting the snapshot still in force.
+      const third = attribution.find((entry) => entry.messageId === 'msg-3')!;
+      assert.equal(third.checkpointId, 'ckpt-1700001120001-bbbb2222');
+      assert.equal(third.inherited, true);
+      assert.equal(third.fromTurn, 2);
+    } finally {
+      await workspace.cleanup();
+    }
+  });
+
+  it('answers with an empty attribution when no session log is at hand', async () => {
+    const workspace = await makeWorkspace('ckpt-attribution-none-');
+    try {
+      await runGit(workspace.dir, [ 'init', '--initial-branch=main' ]);
+      await configureIdentity(workspace.dir);
+      await writeWorkspaceFile(workspace.dir, 'app.ts', 'export const x = 1;\n');
+      await commitAll(workspace.dir, 'initial import');
+      const snapshot = await buildGitSnapshot(workspace.dir, {});
+      assert.deepEqual([ ...snapshot.attribution ], []);
+    } finally {
+      await workspace.cleanup();
+    }
+  });
+});
+
 describe('handleGitRequest', () => {
   let workspace: TempWorkspace;
 

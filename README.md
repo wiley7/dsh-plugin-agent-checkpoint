@@ -97,13 +97,15 @@ alternative can be explored without disturbing the current one; `switch_branch`
 moves between them. Both are plain local git operations with validation —
 nothing is pushed anywhere.
 
-### 6. The commit badge — and enabling checkpoints from the UI
+### 6. A per-reply commit badge — and enabling checkpoints from the UI
 
-Every finalized reply in the DSH web UI gets a quiet pill showing the workspace
-HEAD (`⎇ main 4e850e7`), a `*` when the tree is dirty, and a `⚑` when that commit
-is a confirmed checkpoint. In a project that is not a git repository yet, the pill
-becomes a dashed **⚙ Enable checkpoints** control that initialises the project —
-behind a second click and a server-side `confirm=1` check.
+Every finalized reply in the DSH web UI gets a quiet pill naming the checkpoint
+that was current **when that reply was written** — `⚑ fb62938a` for a confirmed
+snapshot, `✎ 11223344` for a draft, or the plain short commit (`4e850e7`) when the
+project had no checkpoint yet. Older replies keep their old value; they never
+start claiming the newest commit. In a project that is not a git repository yet,
+the pill becomes a dashed **⚙ Enable checkpoints** control that initialises the
+project — behind a second click and a server-side `confirm=1` check.
 [Details below.](#the-commit-badge-in-the-web-ui)
 
 ### 7. Automatic checkpoints, on your terms
@@ -375,14 +377,57 @@ lives in DSH settings so it is editable without touching the project.
 ## The commit badge in the web UI
 
 ```
-⎇ main 4e850e7 *    ⚑
+⚑ fb62938a    ✎ 11223344    4e850e7
 ```
 
-- `4e850e7` — short hash of the workspace HEAD; **click copies the full hash**;
-  the tooltip carries branch, subject, commit time, checkpoint id and workspace.
-- `*` — the working tree has uncommitted changes, so the badge never implies the
-  files match that commit.
-- `⚑` — that commit is a **confirmed checkpoint**; hover for its title.
+Each reply carries the state of the repository **at the moment that reply was
+written**, not today's `HEAD`:
+
+- `⚑ fb62938a` — the reply's turn produced a **confirmed** checkpoint; the value is
+  the checkpoint id's distinguishing suffix.
+- `✎ 11223344` — the reply's turn produced a **draft** checkpoint: saved, but still
+  outside git history.
+- `4e850e7` — no checkpoint existed then, so the badge names the commit that was
+  `HEAD` at that time (quiet, no glyph).
+
+A round that saved nothing keeps pointing at the checkpoint that was still in
+force — an older reply never starts claiming a newer snapshot. Replies written
+before the first commit of the fetched window (60 commits) show no badge at all
+rather than a misleading one. **Click copies the full hash** (the commit hash for
+confirmed snapshots, the checkpoint id for drafts); the tooltip carries the
+checkpoint id, title, status, commit, timestamp and the turn it came from.
+
+### How a reply is attributed
+
+The browser only knows the `messageId` handed to the action strip. The host half
+maps it onto a checkpoint in three steps:
+
+1. `assistant/message` events in the session log give each reply its turn and
+   timestamp (`data.message.id`, `data.turn`, `time`).
+2. `turn/start` / `turn/end` events turn those into a window per turn.
+3. Each checkpoint record (`.dsh-checkpoint/drafts/*.json`,
+   `…/checkpoints/*.json`) lands in the window that contains its `createdAt`; a
+   reply takes the newest checkpoint whose window is not later than its own.
+
+Drafts count as snapshots here, which is why a badge can show a `✎` id that has no
+commit behind it. The attribution array is returned by the read-only route, so
+nothing extra is written and the browser does no git work:
+
+```jsonc
+"attribution": [
+  {
+    "messageId": "32e395ed-…",
+    "turn": 7,
+    "at": 1792582051733,          // epoch ms of the reply
+    "checkpointId": "ckpt-1792582824171-fb62938a",
+    "status": "confirmed",
+    "commitHash": "4e850e71…",
+    "short": "fb62938a",
+    "fromTurn": 7,
+    "inherited": false            // true: saved earlier and still current
+  }
+]
+```
 
 ### Enabling checkpoints from the UI
 
@@ -411,7 +456,7 @@ at. A folder that lives inside another repository answers
 | Access | loopback only (`127.0.0.0/8`, `::1`, `::ffff:` forms); else `403` | same |
 | Methods | `GET`, `HEAD`; else `405` | `POST`; else `405` |
 | Guard | none | `confirm=1` required, else `400 confirmation_required` and **no write** |
-| Response | `{ ok, workspace, source, isRepo, branch, head, isDirty, commits[], capturedAt, error, warnings }` | `{ ok, workspace, created, gitVersion, branch, head, gitignoreUpdated, excludeUpdated, storePath, configPath, warnings, nextSteps }` |
+| Response | `{ ok, workspace, source, isRepo, branch, head, isDirty, commits[], attribution[], capturedAt, error, warnings }` | `{ ok, workspace, created, gitVersion, branch, head, gitignoreUpdated, excludeUpdated, storePath, configPath, warnings, nextSteps }` |
 | Caching | `cache-control: no-store` | same |
 | Writes | none — never commits, stages or resets | working tree and `.git` (init, ignore rules, store) |
 | Errors | `not_a_git_repo`, `invalid_workspace` | `confirmation_required`, `workspace_not_repository_root` (409) |
@@ -422,9 +467,12 @@ memoizes snapshots for 8 s. The route is read-only on purpose: a UI that could
 move `HEAD` would make the “no destructive operation without confirmation”
 guarantee meaningless.
 
-The badge reports the *current* HEAD, not the commit that existed when each reply
-was written. Per-reply attribution needs the per-turn timeline the route already
-returns; it is a roadmap item, not a promise.
+The route also returns `attribution[]` — one entry per assistant message of the
+viewed session — which is what lets each reply name its own checkpoint instead of
+the current `HEAD`. Session logs are parsed once and cached by size+mtime, so a
+20 s poll re-reads only a log that has actually grown. Long sessions are read in
+full (the timeline keeps every turn); a reply whose message is missing from the
+log simply renders no badge.
 
 Badge configuration (entry config of the host half): `workspace` (fallback when a
 request carries no `?session=`) and `maxCommits` (default `120`; requests clamp at
@@ -672,14 +720,16 @@ loader, the session-log reader (including zstd fixtures), the MCP transport itse
 (it spawns `dist/index.js` and talks to it as a client), both loopback routes
 (workspace resolution, timeline, method and loopback fences, the init guard) and
 the browser bundle (loaded in a `node:vm` sandbox with a React shim, so slot wiring,
-the display model and the init control are exercised without a DOM).
-**112 tests, no network access, no writes outside the OS temp dir.**
+the display model, the per-reply attribution and the init control are exercised
+without a DOM).
+**128 tests, no network access, no writes outside the OS temp dir.**
 
 ```
 src/index.ts      MCP stdio server (nine tools)
 src/checkpoint.ts service: drafts, confirmation, rollback
 src/host.ts       web host half: loopback git + init routes
-src/session.ts    DSH session-log discovery and digest
+src/attribution.ts  reply → checkpoint mapping (pure projection)
+src/session.ts    DSH session-log discovery, digest and per-turn timeline
 src/git.ts        system git wrapper
 src/store.ts      .dsh-checkpoint storage and confirmation tokens
 client/client.js  browser half: commit badge (no build step)
@@ -691,7 +741,7 @@ client/client.js  browser half: commit badge (no build step)
 | --- | --- | --- |
 | Destructive ops | two-phase token | same, plus approving from the badge |
 | Context rehydration | tool result digest + sidecar | survive a DSH restart by re-reading sidecars into a fresh session |
-| Badge | current `HEAD` per reply | per-reply attribution from the per-turn timeline the route already returns |
+| Badge | the checkpoint (or commit) current at each reply | inline preview/rollback from the badge |
 | Auto triggers | off / file change / every turn / every N turns (settings card) | per-language rules, per-workspace overrides, "only when tests pass" |
 | Settings surface | trigger + save mode | ignore rules and draft limits editable from the same card |
 | Branching | local create/switch | store export/backup, timeline UI, cross-workspace index |

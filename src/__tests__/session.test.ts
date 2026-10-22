@@ -136,6 +136,57 @@ describe('session capture', () => {
     assert.ok(captured.context.bytes > 0);
   });
 
+  it('decodes a log appended in many zstd frames (the real DSH shape)', async () => {
+    // DSH appends one zstd frame per flushed write, so `session.v4.jsonl.zstd` is
+    // a concatenation of frames. node:zlib decodes only the first one, which used
+    // to reduce a real log to its header record.
+    const events = sampleSessionEvents({ sessionId: 'session-frames', cwd: workspace.dir });
+    const frames = toJsonl(events)
+      .split('\n')
+      .map((line) => compress(`${line}\n`));
+    const dir = path.join(workspace.dshHome, 'sessions', 'bucket-frames', 'session-frames');
+    await mkdir(dir, { recursive: true });
+    const file = path.join(dir, 'session.v4.jsonl.zstd');
+    await writeFile(file, Buffer.concat(frames));
+
+    const header = await readSessionHeader(file);
+    assert.equal(header?.id, 'session-frames');
+
+    const captured = await captureSessionContext({
+      workspacePath: workspace.dir,
+      sessionId: 'session-frames',
+      dshHome: workspace.dshHome,
+      limits: LIMITS,
+    });
+    assert.ok(captured.context.eventCount >= events.length, `expected every frame to decode, saw ${captured.context.eventCount} events`);
+    assert.equal(captured.context.messageCount, 2);
+    assert.equal(captured.context.plan.length, 2);
+    assert.equal(captured.warnings.length, 0);
+  });
+
+  it('keeps the newest events when the read cap is hit', async () => {
+    const events: Array<Record<string, unknown>> = [ { type: 'session', version: 4, id: 'session-tail', cwd: workspace.dir } ];
+    for (let index = 0; index < 20; index += 1) {
+      events.push({
+        type: 'user/message',
+        data: { content: [ { type: 'text', text: `turn ${index} ${'padding '.repeat(20)}` } ], source: { kind: 'user' } },
+      });
+    }
+    await writeSession(workspace.dshHome, 'bucket-tail', 'session-tail', toJsonl(events), { zstd: true });
+
+    const captured = await captureSessionContext({
+      workspacePath: workspace.dir,
+      sessionId: 'session-tail',
+      dshHome: workspace.dshHome,
+      limits: { ...LIMITS, maxReadBytes: 1200, maxMessages: 4 },
+    });
+    const texts = captured.context.messages.map((message) => message.text);
+    assert.ok(texts.length > 0);
+    assert.match(texts.at(-1)!, /turn 19/, 'the newest turn must survive the cap');
+    assert.ok(texts.every((text) => !text.includes('turn 0 ')), 'the oldest turns must be dropped first');
+    assert.equal(captured.context.truncated, true);
+  });
+
   it('prefers the explicitly named session id even when another log is newer', async () => {
     const older = toJsonl(sampleSessionEvents({ sessionId: 'session-wanted', cwd: workspace.dir }));
     const wantedFile = await writeSession(workspace.dshHome, 'bucket-b', 'session-wanted', older, { zstd: true });

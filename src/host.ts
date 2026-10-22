@@ -13,7 +13,7 @@
  * @module dsh-plugin-agent-checkpoint/host
  */
 import type { IncomingMessage, ServerResponse } from 'node:http';
-import { realpath } from 'node:fs/promises';
+import { realpath, stat } from 'node:fs/promises';
 import { isAbsolute, resolve as resolvePath } from 'node:path';
 import { CheckpointError, CheckpointService } from './checkpoint.js';
 import { currentBranch, git, headHash, isDirty, isInsideWorkTree, topLevel } from './git.js';
@@ -24,7 +24,8 @@ import {
   type PolicyState,
   type SettingsServiceLike,
 } from './policy.js';
-import { discoverSessionLog, readSessionHeader, resolveDshHome } from './session.js';
+import { attributeMessages, type CheckpointPoint, type MessageAttribution } from './attribution.js';
+import { discoverSessionLog, readSessionHeader, readSessionTimeline, resolveDshHome, type SessionTimeline } from './session.js';
 import { listRecords } from './store.js';
 import { createTriggerEngine, type TriggerCheckpointRequest, type TriggerEngine } from './trigger.js';
 import type { CheckpointRecord } from './types.js';
@@ -85,6 +86,11 @@ export interface GitSnapshot {
   isDirty: boolean;
   /** Commits newest first; empty when the repository has no commit yet. */
   commits: CommitEntry[];
+  /**
+   * The checkpoint each assistant message was looking at when it was written,
+   * oldest first. Empty when the session log could not be read.
+   */
+  attribution: MessageAttribution[];
   capturedAt: string;
   /** Stable error code (`not_a_git_repo`, `invalid_workspace`, …) or null. */
   error: string | null;
@@ -129,6 +135,8 @@ export interface WorkspaceResolution {
   workspace: string;
   source: WorkspaceSource;
   sessionId: string | null;
+  /** Session log the workspace was read from, when one was found. */
+  sessionFile: string | null;
   warnings: string[];
 }
 
@@ -180,11 +188,13 @@ export async function resolveWorkspace(input: ResolveWorkspaceInput = {}): Promi
 
   if (input.workspace) {
     const canonical = await canonicalDirectory(input.workspace);
-    if (canonical !== null) return { workspace: canonical, source: 'query', sessionId: input.sessionId ?? null, warnings };
+    if (canonical !== null) return { workspace: canonical, source: 'query', sessionId: input.sessionId ?? null, sessionFile: null, warnings };
     warnings.push(`ignoring non-absolute workspace query: ${input.workspace}`);
   }
 
   const sessionId = input.sessionId ?? null;
+  // Kept so later fallbacks can still report which log named the workspace.
+  let sessionFile: string | null = null;
   if (sessionId) {
     const discovery = await discoverSessionLog({
       workspacePath: '',
@@ -192,11 +202,12 @@ export async function resolveWorkspace(input: ResolveWorkspaceInput = {}): Promi
       dshHome: resolveDshHome(env.DSH_HOME),
     }).catch(() => null);
     if (discovery?.warning) warnings.push(discovery.warning);
+    sessionFile = discovery?.file ?? null;
     const header = discovery?.file ? await readSessionHeader(discovery.file).catch(() => null) : null;
     const fromSession = header?.cwd ?? null;
     if (fromSession !== null) {
       const canonical = await canonicalDirectory(fromSession);
-      if (canonical !== null) return { workspace: canonical, source: 'session', sessionId, warnings };
+      if (canonical !== null) return { workspace: canonical, source: 'session', sessionId, sessionFile, warnings };
       warnings.push(`session ${sessionId} reports a non-absolute cwd: ${fromSession}`);
     } else if (discovery?.file) {
       warnings.push(`session log ${discovery.file} has no cwd header`);
@@ -205,20 +216,20 @@ export async function resolveWorkspace(input: ResolveWorkspaceInput = {}): Promi
 
   if (input.config?.workspace) {
     const canonical = await canonicalDirectory(input.config.workspace);
-    if (canonical !== null) return { workspace: canonical, source: 'config', sessionId, warnings };
+    if (canonical !== null) return { workspace: canonical, source: 'config', sessionId, sessionFile, warnings };
     warnings.push(`ignoring non-absolute configured workspace: ${input.config.workspace}`);
   }
 
   const fromEnv = env.DSH_WORKSPACE;
   if (fromEnv && fromEnv.trim() !== '') {
     const canonical = await canonicalDirectory(fromEnv);
-    if (canonical !== null) return { workspace: canonical, source: 'env', sessionId, warnings };
+    if (canonical !== null) return { workspace: canonical, source: 'env', sessionId, sessionFile, warnings };
     warnings.push(`ignoring non-absolute $DSH_WORKSPACE: ${fromEnv}`);
   }
 
   const cwd = input.cwd ?? process.cwd();
   const canonical = (await canonicalDirectory(cwd)) ?? resolvePath(cwd);
-  return { workspace: canonical, source: 'cwd', sessionId, warnings };
+  return { workspace: canonical, source: 'cwd', sessionId, sessionFile, warnings };
 }
 
 /** Index confirmed checkpoints by the commit they were created from. */
@@ -234,6 +245,59 @@ export async function checkpointIndex(workspacePath: string): Promise<Map<string
     });
   }
   return index;
+}
+
+/** Project stored checkpoint records into the points attribution needs. */
+export function checkpointPoints(records: CheckpointRecord[]): CheckpointPoint[] {
+  const points: CheckpointPoint[] = [];
+  for (const record of records) {
+    if (typeof record.id !== 'string' || record.id === '') continue;
+    const createdAt = Date.parse(record.createdAt);
+    if (!Number.isFinite(createdAt)) continue;
+    points.push({
+      id: record.id,
+      title: typeof record.title === 'string' ? record.title : '',
+      status: record.status === 'confirmed' ? 'confirmed' : 'draft',
+      createdAt,
+      commitHash: typeof record.commitHash === 'string' && record.commitHash !== '' ? record.commitHash : null,
+    });
+  }
+  return points;
+}
+
+/** Session logs are append-only and polled every 20 s; re-read only when they grow. */
+const timelineCache = new Map<string, { key: string; timeline: SessionTimeline }>();
+
+/** Read a session chronology, reusing the previous parse when the log is unchanged. */
+export async function readSessionTimelineCached(file: string): Promise<SessionTimeline | null> {
+  const info = await stat(file).catch(() => null);
+  if (info === null) return null;
+  const key = `${info.size}:${info.mtimeMs}`;
+  const cached = timelineCache.get(file);
+  if (cached !== undefined && cached.key === key) return cached.timeline;
+  try {
+    const timeline = await readSessionTimeline({ file });
+    timelineCache.set(file, { key, timeline });
+    return timeline;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Attribute each assistant message of the session to the checkpoint that was
+ * current when it was written. Both drafts and confirmed snapshots count: the
+ * badge reports the snapshot id, and a draft is a snapshot too.
+ */
+export async function buildAttribution(workspacePath: string, sessionFile: string | null): Promise<MessageAttribution[]> {
+  if (sessionFile === null || sessionFile === '') return [];
+  const timeline = await readSessionTimelineCached(sessionFile);
+  if (timeline === null) return [];
+  const [ confirmed, drafts ] = await Promise.all([
+    listRecords(workspacePath, 'checkpoints').catch(() => []),
+    listRecords(workspacePath, 'drafts').catch(() => []),
+  ]);
+  return attributeMessages(timeline, checkpointPoints([ ...drafts, ...confirmed ]));
 }
 
 /** Read the newest `maxCommits` commits, oldest failure (empty repo) tolerated. */
@@ -267,7 +331,13 @@ export async function readCommitTimeline(
 /** Build the payload of one {@link ROUTE_PATH} response. */
 export async function buildGitSnapshot(
   workspacePath: string,
-  options: { maxCommits?: number; source?: WorkspaceSource; sessionId?: string | null; warnings?: string[] } = {},
+  options: {
+    maxCommits?: number;
+    source?: WorkspaceSource;
+    sessionId?: string | null;
+    sessionFile?: string | null;
+    warnings?: string[];
+  } = {},
 ): Promise<GitSnapshot> {
   const source = options.source ?? 'cwd';
   const sessionId = options.sessionId ?? null;
@@ -292,6 +362,7 @@ export async function buildGitSnapshot(
       head: null,
       isDirty: false,
       commits: [],
+      attribution: [],
       capturedAt,
       error: 'not_a_git_repo',
       warnings,
@@ -304,7 +375,10 @@ export async function buildGitSnapshot(
     isDirty(workspacePath).catch(() => false),
     checkpointIndex(workspacePath),
   ]);
-  const commits = await readCommitTimeline(workspacePath, maxCommits, index);
+  const [ commits, attribution ] = await Promise.all([
+    readCommitTimeline(workspacePath, maxCommits, index),
+    buildAttribution(workspacePath, options.sessionFile ?? null),
+  ]);
   const resolvedHead = head ? commits.find((entry) => entry.hash === head) ?? (await headEntry(workspacePath, head, index)) : null;
   if (head && resolvedHead === null) warnings.push('HEAD is outside the returned commit window and could not be read as an object');
 
@@ -318,6 +392,7 @@ export async function buildGitSnapshot(
     head: resolvedHead,
     isDirty: dirty,
     commits,
+    attribution,
     capturedAt,
     error: null,
     warnings,
@@ -399,6 +474,7 @@ export async function handleGitRequest(
     maxCommits: parseMaxCommits(queryParam(url, 'limit') ?? config.maxCommits ?? DEFAULT_MAX_COMMITS),
     source: resolution.source,
     sessionId: resolution.sessionId,
+    sessionFile: resolution.sessionFile,
     warnings: resolution.warnings,
   });
   sendJson(res, 200, snapshot);

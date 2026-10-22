@@ -52,6 +52,36 @@ const SNAPSHOT = {
   },
   isDirty: true,
   commits: [],
+  // Two replies from two different turns: the older one must keep naming the
+  // older snapshot even after a newer checkpoint exists.
+  attribution: [
+    {
+      messageId: 'msg-older',
+      turn: 3,
+      at: 1_700_000_000_000,
+      checkpointId: 'ckpt-1699999999999-11223344',
+      title: 'First save',
+      status: 'draft',
+      commitHash: null,
+      short: '11223344',
+      createdAt: 1_699_999_999_999,
+      fromTurn: 3,
+      inherited: false,
+    },
+    {
+      messageId: 'msg-newer',
+      turn: 4,
+      at: 1_700_000_050_000,
+      checkpointId: 'ckpt-1700000000000-abcd1234',
+      title: 'Release candidate',
+      status: 'confirmed',
+      commitHash: 'a1b2c3d4e5f6a7b8c9d0',
+      short: 'abcd1234',
+      createdAt: 1_700_000_000_000,
+      fromTurn: 4,
+      inherited: false,
+    },
+  ],
   capturedAt: '2026-10-21T11:22:44.000Z',
   error: null,
   warnings: [],
@@ -278,6 +308,111 @@ describe('client display model', () => {
     assert.ok(texts.some((text) => text.includes('a1b2c3d')), 'short hash should render');
     assert.ok(texts.some((text) => text.includes('*')), 'dirty marker should render');
     assert.ok(texts.some((text) => text.includes('⚑')), 'checkpoint flag should render');
+  });
+});
+
+describe('per-message checkpoint attribution', () => {
+  /** Every string rendered under an element, in document order. */
+  function textsOf(element: Element | null): string[] {
+    if (element === null) return [];
+    const out: string[] = [];
+    for (const child of element.children) {
+      if (typeof child === 'string') out.push(child);
+      else if (child !== null && typeof child === 'object') out.push(...textsOf(child as Element));
+    }
+    return out;
+  }
+
+  /** Render the badge for one reply. */
+  function badge(bundle: Bundle, messageId: string | undefined): Element | null {
+    return bundle.exports.CommitBadge({
+      sessionId: 'session-abc',
+      messageId,
+      t: (key: string) => key,
+    }) as Element | null;
+  }
+
+  it('names the checkpoint that was current when each reply was written', async () => {
+    const bundle = await loadBundle({ state: { snapshot: SNAPSHOT, body: SNAPSHOT } });
+    const older = badge(bundle, 'msg-older') as Element;
+    const newer = badge(bundle, 'msg-newer') as Element;
+    assert.ok(older && newer);
+
+    assert.equal(older.props['data-agent-checkpoint-commit'], '11223344');
+    assert.equal(older.props['data-agent-checkpoint-status'], 'draft');
+    assert.ok(textsOf(older).some((text) => text.includes('11223344')));
+    assert.equal(textsOf(older).some((text) => text.includes('abcd1234')), false, 'the old reply must not claim the newer snapshot');
+    assert.equal(textsOf(older).some((text) => text.includes('*')), false, 'the head dirty marker does not belong to an attributed reply');
+
+    assert.equal(newer.props['data-agent-checkpoint-commit'], 'abcd1234');
+    assert.equal(newer.props['data-agent-checkpoint-status'], 'confirmed');
+    assert.ok(textsOf(newer).some((text) => text.includes('⚑')));
+  });
+
+  it('keeps the full id, title and commit hash in the tooltip', async () => {
+    const bundle = await loadBundle();
+    // The component renders this string as its title; assert the model directly
+    // because the React shim seeds every useState (including the copy flag).
+    const newer = bundle.exports.describeMessageCheckpoint(SNAPSHOT, 'msg-newer');
+    assert.match(newer.title, /ckpt-1700000000000-abcd1234/);
+    assert.match(newer.title, /confirmed snapshot/);
+    assert.match(newer.title, /Release candidate/);
+    assert.match(newer.title, /commit a1b2c3d4e5f6a7b8c9d0/);
+    assert.match(newer.title, /saved in turn 4/);
+    assert.equal(newer.hash, 'a1b2c3d4e5f6a7b8c9d0');
+
+    const older = bundle.exports.describeMessageCheckpoint(SNAPSHOT, 'msg-older');
+    assert.match(older.title, /draft snapshot, not committed yet/);
+    assert.equal(older.hash, 'ckpt-1699999999999-11223344', 'a draft copies its checkpoint id, it has no commit');
+    assert.equal(older.label, '✎ 11223344');
+  });
+
+  it('renders nothing for a reply that predates every checkpoint', async () => {
+    const bundle = await loadBundle({ state: { snapshot: SNAPSHOT, body: SNAPSHOT } });
+    assert.equal(bundle.exports.attributeMessage(SNAPSHOT, 'msg-older').messageId, 'msg-older');
+    assert.equal(bundle.exports.attributeMessage(SNAPSHOT, 'msg-unknown'), null);
+    assert.equal(bundle.exports.describeMessageCheckpoint(SNAPSHOT, 'msg-unknown'), null);
+    assert.equal(badge(bundle, 'msg-unknown'), null);
+    const empty = { ...SNAPSHOT, attribution: [ { messageId: 'msg-plain', channel: null } ] };
+    assert.equal(bundle.exports.describeMessageCheckpoint(empty, 'msg-plain'), null);
+    assert.equal(badge(bundle, 'msg-plain'), null);
+  });
+
+  it('shows the commit that was current when a reply has no checkpoint of its own', async () => {
+    const withCommits = {
+      ...SNAPSHOT,
+      commits: [
+        { hash: 'c3c3c3c3c3c3c3c3c3c3', short: 'c3c3c3c', subject: 'third', committedAt: '2026-10-21T13:00:00.000Z', committedAtMs: 1_700_000_300_000, checkpoint: null },
+        { hash: 'b2b2b2b2b2b2b2b2b2b2', short: 'b2b2b2b', subject: 'second', committedAt: '2026-10-21T12:00:00.000Z', committedAtMs: 1_700_000_100_000, checkpoint: null },
+        { hash: 'a1a1a1a1a1a1a1a1a1a1', short: 'a1a1a1a', subject: 'first', committedAt: '2026-10-21T10:00:00.000Z', committedAtMs: 1_699_999_000_000, checkpoint: null },
+      ],
+      attribution: [
+        { messageId: 'msg-plain', turn: 2, at: 1_700_000_150_000, checkpointId: null, title: null, status: null, commitHash: null, short: null, createdAt: null, fromTurn: null, inherited: false },
+      ],
+    };
+    const bundle = await loadBundle({ state: { snapshot: withCommits, body: withCommits } });
+    const model = bundle.exports.describeMessageBadge(withCommits, 'msg-plain');
+    assert.equal(model.kind, 'commit');
+    assert.equal(model.short, 'b2b2b2b', 'the commit committed before the reply, not HEAD');
+    assert.equal(model.status, 'commit');
+    assert.match(model.title, /no checkpoint at this point/);
+
+    const element = badge(bundle, 'msg-plain') as Element;
+    assert.equal(element.props['data-agent-checkpoint-commit'], 'b2b2b2b');
+    assert.equal(element.props['data-agent-checkpoint-status'], 'head');
+    assert.equal(textsOf(element).some((text) => text.includes('⚑')), false);
+
+    // Before the first commit of the window there is nothing to name.
+    const early = { ...withCommits, attribution: [ { ...withCommits.attribution[0], at: 1_699_000_000_000 } ] };
+    assert.equal(bundle.exports.describeMessageBadge(early, 'msg-plain'), null);
+  });
+
+  it('falls back to the workspace head only when the host passes no message id', async () => {
+    const bundle = await loadBundle({ state: { snapshot: SNAPSHOT, body: SNAPSHOT } });
+    const legacy = badge(bundle, undefined) as Element;
+    assert.equal(legacy.props['data-agent-checkpoint-commit'], 'a1b2c3d');
+    assert.equal(legacy.props['data-agent-checkpoint-status'], 'confirmed');
+    assert.ok(textsOf(legacy).some((text) => text.includes('main')));
   });
 });
 
