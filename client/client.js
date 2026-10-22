@@ -188,6 +188,19 @@ window.__ModuleLoader__.load({
 		}
 
 		/**
+		 * Whether the host half computed per-message attribution.
+		 *
+		 * A host from before this field existed answers without `attribution`; the
+		 * badge then keeps its old workspace-head behaviour instead of vanishing.
+		 * @param snapshot - normalized snapshot, or null.
+		 * @returns true when the payload carries an attribution array.
+		 */
+		function supportsAttribution(snapshot) {
+			const normalized = normalizeSnapshot(snapshot);
+			return normalized !== null && Array.isArray(normalized.attribution);
+		}
+
+		/**
 		 * The commit that was HEAD at one instant, taken from the fetched window.
 		 * @param commits - newest-first commit timeline of the snapshot.
 		 * @param at - epoch milliseconds of an assistant message.
@@ -802,8 +815,9 @@ window.__ModuleLoader__.load({
 			// Which checkpoint belongs to *this* reply. Older hosts that do not pass a
 			// message id fall back to the workspace head so the badge keeps working.
 			const messageId = typeof props.messageId === "string" && props.messageId !== "" ? props.messageId : null;
-			const attributed = messageId === null ? null : describeMessageBadge(view.snapshot, messageId);
-			if (messageId !== null && attributed === null) return null;
+			const canAttribute = messageId !== null && supportsAttribution(view.snapshot);
+			const attributed = canAttribute ? describeMessageBadge(view.snapshot, messageId) : null;
+			if (canAttribute && attributed === null) return null;
 			const model = attributed !== null
 				? { short: attributed.short, hash: attributed.hash, title: attributed.title, status: attributed.status === "commit" ? null : attributed.status, label: attributed.label }
 				: { short: view.model.short, hash: view.model.hash, title: view.model.title, status: view.model.checkpoint !== null ? "confirmed" : null, label: view.model.label };
@@ -1073,6 +1087,7 @@ window.__ModuleLoader__.load({
 		exports.attributeMessage = attributeMessage;
 		exports.describeMessageCheckpoint = describeMessageCheckpoint;
 		exports.describeMessageBadge = describeMessageBadge;
+		exports.supportsAttribution = supportsAttribution;
 		exports.commitAt = commitAt;
 		exports.normalizeSnapshot = normalizeSnapshot;
 		exports.badgeUrl = badgeUrl;

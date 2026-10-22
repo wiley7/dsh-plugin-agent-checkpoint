@@ -407,6 +407,17 @@ describe('per-message checkpoint attribution', () => {
     assert.equal(bundle.exports.describeMessageBadge(early, 'msg-plain'), null);
   });
 
+  it('keeps the old head badge when the host half predates attribution', async () => {
+    const legacyHost = { ...SNAPSHOT } as Record<string, unknown>;
+    delete legacyHost.attribution;
+    const bundle = await loadBundle({ state: { snapshot: legacyHost, body: legacyHost } });
+    assert.equal(bundle.exports.supportsAttribution(legacyHost), false);
+    assert.equal(bundle.exports.supportsAttribution(SNAPSHOT), true);
+    const element = badge(bundle, 'msg-newer') as Element;
+    assert.ok(element, 'a version-skewed host must not lose its badge');
+    assert.equal(element.props['data-agent-checkpoint-commit'], 'a1b2c3d');
+  });
+
   it('falls back to the workspace head only when the host passes no message id', async () => {
     const bundle = await loadBundle({ state: { snapshot: SNAPSHOT, body: SNAPSHOT } });
     const legacy = badge(bundle, undefined) as Element;
