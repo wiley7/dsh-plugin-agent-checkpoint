@@ -25,6 +25,7 @@ import {
   apply,
   buildGitSnapshot,
   checkpointIndex,
+  createAutomaticCheckpoints,
   handleGitRequest,
   handleInitRequest,
   isLoopbackAddress,
@@ -32,7 +33,7 @@ import {
   parseMaxCommits,
   resolveWorkspace,
 } from '../host.js';
-import { makeWorkspace, sampleSessionEvents, toJsonl, writeWorkspaceFile, type TempWorkspace } from './helpers.js';
+import { gitOut, makeWorkspace, sampleSessionEvents, toJsonl, writeWorkspaceFile, type TempWorkspace } from './helpers.js';
 
 /** Captured HTTP response for the route tests. */
 interface RecordedResponse {
@@ -354,9 +355,9 @@ describe('handleGitRequest', () => {
     assert.equal((body.commits as unknown[]).length, 1);
   });
 
-  it('registers both exact routes through ctx.effect', () => {
+  it('registers both exact routes and the automatic-checkpoint effect', () => {
     const registrations: Array<{ kind: string; path: string; handler?: unknown }> = [];
-    let effects = 0;
+    const labels: Array<string | undefined> = [];
     let disposed = 0;
     const ctx = {
       webServer: {
@@ -367,16 +368,134 @@ describe('handleGitRequest', () => {
           };
         },
       },
-      effect(run: () => () => void) {
-        effects += 1;
+      effect(run: () => () => void, label?: string) {
+        labels.push(label);
         return run();
       },
     };
     apply(ctx as never, { workspace: workspace.dir });
-    assert.equal(effects, 1);
     assert.deepEqual(registrations.map((route) => route.path), [ ROUTE_PATH, INIT_ROUTE_PATH ]);
     assert.ok(registrations.every((route) => route.kind === 'exact'));
     assert.equal(disposed, 0);
+    assert.equal(labels.length, 2);
+    assert.equal(labels[0], 'agent-checkpoint: git badge routes');
+    assert.match(String(labels[1]), /automatic checkpoints/);
+  });
+
+  it('registers the settings namespace when the host serves settings', () => {
+    const registrations: Array<{ namespace: string }> = [];
+    const requested: string[][] = [];
+    const ctx = {
+      webServer: { register: () => () => undefined },
+      effect: (run: () => () => void) => run(),
+      inject(dependencies: string[], callback: (scoped: unknown) => void) {
+        requested.push(dependencies);
+        callback({
+          settings: {
+            register(namespace: string) {
+              registrations.push({ namespace });
+              return { get: () => ({ trigger: 'off', apply: 'draft', interval_turns: 5 }), watch: () => () => undefined };
+            },
+          },
+        });
+      },
+      on: () => () => undefined,
+    };
+    apply(ctx as never, { workspace: workspace.dir });
+    assert.deepEqual(requested, [ [ 'settings' ] ]);
+    assert.deepEqual(registrations.map((entry) => entry.namespace), [ 'agent-checkpoint' ]);
+  });
+
+  it('degrades to no automation when the host exposes neither settings nor events', () => {
+    const ctx = { webServer: { register: () => () => undefined } };
+    assert.doesNotThrow(() => apply(ctx as never, { workspace: workspace.dir }));
+  });
+});
+
+describe('createAutomaticCheckpoints', () => {
+  /** Install a git identity so the automatic commit path can run anywhere. */
+  async function repoWithFile() {
+    const workspace = await makeWorkspace('ckpt-host-auto-');
+    await runGit(workspace.dir, [ 'init', '-b', 'main' ]);
+    await configureIdentity(workspace.dir);
+    await writeWorkspaceFile(workspace.dir, 'app.txt', 'one\n');
+    await commitAll(workspace.dir, 'initial import');
+    return workspace;
+  }
+
+  /** Serve one session log whose header names `cwd`. */
+  async function logFor(workspace: string, sessionId: string) {
+    const dshHome = process.env.DSH_HOME;
+    assert.ok(dshHome);
+    await writeSessionLog(dshHome, sessionId, workspace);
+  }
+
+  it('saves a draft when a turn changed files', async () => {
+    const workspace = await repoWithFile();
+    await logFor(workspace.dir, 'session-auto-draft');
+    const logs: string[] = [];
+    const { engine, policy } = createAutomaticCheckpoints({ config: {}, log: (message) => logs.push(message) });
+    policy.adopt({ trigger: 'file_change', apply: 'draft' });
+    await writeWorkspaceFile(workspace.dir, 'app.txt', 'two\n');
+
+    const outcome = await engine.handle({ id: 'session-auto-draft' }, { type: 'turn/end', data: { turn: 1 } });
+    assert.equal(outcome.fired, true);
+    assert.equal(outcome.fired === true && outcome.status, 'draft');
+    const draftId = outcome.fired === true ? outcome.checkpointId : '';
+    const { listAllCheckpoints } = await import('../store.js');
+    const records = await listAllCheckpoints(workspace.dir);
+    assert.equal(records.length, 1);
+    assert.equal(records[0]?.id, draftId);
+    assert.equal(records[0]?.status, 'draft');
+    assert.match(String(records[0]?.title), /Automatic checkpoint/);
+    assert.match(String(records[0]?.remark), /changed files/);
+    assert.deepEqual(records[0]?.tags, [ 'auto', 'file_change' ]);
+    assert.match(logs.join('\n'), /automatic checkpoints: draft/);
+  });
+
+  it('commits in "apply: commit" mode, without any confirmation token', async () => {
+    const workspace = await repoWithFile();
+    await logFor(workspace.dir, 'session-auto-commit');
+    const { engine, policy } = createAutomaticCheckpoints({ config: {}, log: () => undefined });
+    policy.adopt({ trigger: 'turn', apply: 'commit' });
+    await writeWorkspaceFile(workspace.dir, 'app.txt', 'three\n');
+
+    const outcome = await engine.handle({ id: 'session-auto-commit' }, { type: 'turn/end', data: { turn: 4 } });
+    assert.equal(outcome.fired, true);
+    assert.equal(outcome.fired === true && outcome.status, 'confirmed');
+    const subject = await gitOut(workspace.dir, [ 'log', '-1', '--pretty=%s' ]);
+    assert.equal(subject.trim(), 'checkpoint: automatic save after turn 4');
+    const head = await gitOut(workspace.dir, [ 'log', '-1', '--pretty=%H' ]);
+    const { listAllCheckpoints } = await import('../store.js');
+    const records = await listAllCheckpoints(workspace.dir);
+    assert.equal(records[0]?.status, 'confirmed');
+    assert.equal(records[0]?.commitHash, head.trim());
+  });
+
+  it('never uses the configured workspace when the session names none', async () => {
+    const workspace = await repoWithFile();
+    const { engine, policy } = createAutomaticCheckpoints({ config: { workspace: workspace.dir }, log: () => undefined });
+    policy.adopt({ trigger: 'turn', apply: 'draft' });
+    const outcome = await engine.handle({ id: 'session-without-log' }, { type: 'turn/end', data: { turn: 1 } });
+    assert.deepEqual(outcome, { fired: false, reason: 'no_workspace', turn: 1 });
+    const { listAllCheckpoints } = await import('../store.js');
+    assert.deepEqual(await listAllCheckpoints(workspace.dir), []);
+  });
+
+  it('skips a session whose project is not a repository root', async () => {
+    const workspace = await repoWithFile();
+    const plain = await makeWorkspace('ckpt-host-auto-plain-');
+    await logFor(plain.dir, 'session-auto-norepo');
+    const { engine, policy } = createAutomaticCheckpoints({ config: {}, log: () => undefined });
+    policy.adopt({ trigger: 'turn', apply: 'draft' });
+    assert.deepEqual(await engine.handle({ id: 'session-auto-norepo' }, { type: 'turn/end', data: { turn: 1 } }), {
+      fired: false,
+      reason: 'not_a_repository',
+      turn: 1,
+    });
+    const { existsSync } = await import('node:fs');
+    assert.equal(existsSync(`${plain.dir}/.git`), false);
+    assert.ok(workspace.dir.length > 0);
   });
 });
 

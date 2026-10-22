@@ -133,6 +133,162 @@ window.__ModuleLoader__.load({
 		}
 		//#endregion
 
+		//#region policy core
+		/** Settings namespace shared with the host half (`src/config.ts`). */
+		const POLICY_NAMESPACE = "agent-checkpoint";
+		/** Values the `trigger` field accepts, in display order. */
+		const TRIGGER_IDS = [ "off", "file_change", "turn", "interval_turns" ];
+		/** Values the `apply` field accepts, in display order. */
+		const APPLY_IDS = [ "draft", "commit" ];
+		/** Documented defaults: rendering must never let an unknown value through. */
+		const POLICY_DEFAULTS = { trigger: "off", apply: "draft", interval_turns: 5 };
+		/** Lower bound of the interval spinner (`interval_turns`). */
+		const INTERVAL_MIN = 1;
+		/** Upper bound of the interval spinner (`interval_turns`). */
+		const INTERVAL_MAX = 50;
+
+		/**
+		 * Coerce one interval value into an integer inside 1..50.
+		 * @param raw - number or numeric string from the settings store / input.
+		 * @returns the clamped integer, or null when the value is not numeric.
+		 */
+		function clampIntervalTurns(raw) {
+			const number = typeof raw === "number" ? raw : typeof raw === "string" && raw.trim() !== "" ? Number(raw) : NaN;
+			if (!Number.isFinite(number)) return null;
+			const rounded = Math.round(number);
+			if (rounded < INTERVAL_MIN) return INTERVAL_MIN;
+			if (rounded > INTERVAL_MAX) return INTERVAL_MAX;
+			return rounded;
+		}
+
+		/**
+		 * Normalize a persisted settings value onto the documented contract.
+		 *
+		 * Unknown, absent or wrong-typed fields fall back to {@link POLICY_DEFAULTS},
+		 * so a render never has to deal with `undefined` and a stale value written
+		 * by a newer build cannot blank the card.
+		 * @param raw - `value` of the settings scope snapshot, or a flat state.
+		 * @returns the normalized `{ trigger, apply, interval_turns }` value.
+		 */
+		function normalizePolicyValue(raw) {
+			const value = raw !== null && typeof raw === "object" && !Array.isArray(raw) ? raw : {};
+			const trigger = TRIGGER_IDS.indexOf(value.trigger) >= 0 ? value.trigger : POLICY_DEFAULTS.trigger;
+			const apply = APPLY_IDS.indexOf(value.apply) >= 0 ? value.apply : POLICY_DEFAULTS.apply;
+			const interval = clampIntervalTurns(value.interval_turns);
+			return {
+				trigger,
+				apply,
+				interval_turns: interval === null ? POLICY_DEFAULTS.interval_turns : interval,
+			};
+		}
+
+		/**
+		 * Materialize one rendered policy state.
+		 *
+		 * Accepts either a bound settings snapshot (`{ status, value, writable }`,
+		 * the shape `settingsScope.bind()` hands out) or this module's own flat
+		 * store state (which already spells the fields out).
+		 * @param raw - bound snapshot or flat state, possibly null before mount.
+		 * @returns `{ status, writable, trigger, apply, interval_turns }`.
+		 */
+		function policyStateOf(raw) {
+			const source = raw !== null && typeof raw === "object" && !Array.isArray(raw) ? raw : null;
+			const status = source !== null && (source.status === "ready" || source.status === "unavailable") ? source.status : "loading";
+			const normalized = normalizePolicyValue(source !== null && source.value !== undefined ? source.value : source);
+			return {
+				status,
+				writable: source !== null && source.writable === true,
+				trigger: normalized.trigger,
+				apply: normalized.apply,
+				interval_turns: normalized.interval_turns,
+			};
+		}
+
+		/**
+		 * Whether two rendered policy states are equal field by field.
+		 * @param a - first state.
+		 * @param b - second state.
+		 * @returns true when publishing `b` would be a no-op.
+		 */
+		function samePolicyState(a, b) {
+			return a.status === b.status && a.writable === b.writable && a.trigger === b.trigger && a.apply === b.apply && a.interval_turns === b.interval_turns;
+		}
+
+		/**
+		 * The store the card subscribes to and every write goes through.
+		 *
+		 * `attach` adopts the settings scope bound to {@link POLICY_NAMESPACE}:
+		 * it reads the host snapshot once and re-syncs on every change. `set`
+		 * updates the local state first — the card must react to its own click
+		 * before the write round-trips — then persists through the bound scope, so
+		 * there is no staging and no save button.
+		 * @returns store facade for `hooks.checkpointPolicy` and the card.
+		 */
+		function createPolicyStore() {
+			let state = policyStateOf(null);
+			let scope = null;
+			const listeners = new Set();
+
+			function publish(next) {
+				if (samePolicyState(state, next)) return;
+				state = next;
+				for (const listener of [ ...listeners ]) {
+					try {
+						listener();
+					} catch (error) {
+						console.error("dsh-plugin-agent-checkpoint: policy listener failed", error);
+					}
+				}
+			}
+
+			function nextValueOf(field, value) {
+				if (field === "trigger") return TRIGGER_IDS.indexOf(value) >= 0 ? value : null;
+				if (field === "apply") return APPLY_IDS.indexOf(value) >= 0 ? value : null;
+				if (field === "interval_turns") return clampIntervalTurns(value);
+				return null;
+			}
+
+			return {
+				subscribe(listener) {
+					listeners.add(listener);
+					return () => {
+						listeners.delete(listener);
+					};
+				},
+				getSnapshot() {
+					return state;
+				},
+				attach(bound) {
+					scope = bound;
+					const sync = () => {
+						const snapshot = bound !== null && typeof bound === "object" && typeof bound.getSnapshot === "function" ? bound.getSnapshot() : null;
+						publish(policyStateOf(snapshot));
+					};
+					sync();
+					return bound !== null && typeof bound === "object" && typeof bound.subscribe === "function" ? bound.subscribe(sync) : () => {};
+				},
+				set(field, value) {
+					const next = nextValueOf(field, value);
+					// Values outside the contract are dropped here rather than stored:
+					// a stale card must never write a value the host cannot interpret.
+					if (next === null) return;
+					const patch = {};
+					patch[field] = next;
+					publish({ ...state, ...patch });
+					if (scope === null || typeof scope.set !== "function") return;
+					try {
+						scope.set(field, next);
+					} catch (error) {
+						console.error("dsh-plugin-agent-checkpoint: settings write failed", error);
+					}
+				},
+			};
+		}
+
+		/** Shared policy store: one per browser tab, like the badge snapshot store. */
+		const policyStore = createPolicyStore();
+		//#endregion
+
 		//#region snapshot store
 		/**
 		 * One memoized, shareable snapshot per viewed session.
@@ -278,6 +434,29 @@ window.__ModuleLoader__.load({
 			"init.cancel": "Cancel",
 			"init.running": "Enabling checkpoints…",
 			"init.failed": "Setup failed — click to retry",
+			"policy.name": "Automatic checkpoints",
+			"policy.desc": "Choose when the assistant saves your progress by itself. Saves are drafts by default — nothing is committed until you say so.",
+			"policy.trigger.off.label": "Off",
+			"policy.trigger.off.hint": "Nothing is created automatically. Ask the assistant to save when you want a checkpoint.",
+			"policy.trigger.file_change.label": "Whenever files change",
+			"policy.trigger.file_change.hint": "A backup is created after any round that changed files. Quiet rounds are skipped.",
+			"policy.trigger.turn.label": "After every message",
+			"policy.trigger.turn.hint": "A backup is created after every round, including the conversation when no file changed.",
+			"policy.trigger.interval.label": "Every few messages",
+			"policy.trigger.interval.hint": "A backup is created every N rounds, for example every 5.",
+			"policy.interval.label": "Number of rounds",
+			"policy.interval.unit": "rounds",
+			"policy.apply.label": "When saving",
+			"policy.apply.draft.label": "Keep as draft",
+			"policy.apply.draft.hint": "Safe default: drafts stay outside git history until you confirm one.",
+			"policy.apply.commit.label": "Commit right away",
+			"policy.apply.commit.hint": "Each save becomes a real git commit. The badge under the reply shows it.",
+			"policy.note.draft": "Drafts are stored in .dsh-checkpoint and never enter git history on their own.",
+			"policy.note.commit": "Every save writes a git commit in this project, so git history grows with your conversation.",
+			"policy.loading": "Reading settings…",
+			"policy.unavailable": "This DSH build does not expose settings, so automatic checkpoints are unavailable.",
+			"policy.readonly": "These settings are locked by the host configuration.",
+			"policy.saved": "Saved",
 		};
 		const zh = {
 			"commit.aria": "工作区当前提交：{{short}}，点击复制完整哈希",
@@ -291,6 +470,29 @@ window.__ModuleLoader__.load({
 			"init.cancel": "取消",
 			"init.running": "正在启用检查点…",
 			"init.failed": "启用失败，点击重试",
+			"policy.name": "自动检查点",
+			"policy.desc": "选什么时候让助手自动帮你保存进度。默认只存草稿，不确认就不会提交到 git。",
+			"policy.trigger.off.label": "关闭",
+			"policy.trigger.off.hint": "不自动创建。需要时说一句「保存一下」即可。",
+			"policy.trigger.file_change.label": "改了文件就保存",
+			"policy.trigger.file_change.hint": "这一轮改动过文件就自动存一份；没改文件就跳过。",
+			"policy.trigger.turn.label": "每次对话都保存",
+			"policy.trigger.turn.hint": "每轮对话结束都存一份，即使没改文件也会连对话一起存。",
+			"policy.trigger.interval.label": "每隔几次对话保存",
+			"policy.trigger.interval.hint": "每 N 轮存一次，比如填 5 就是每 5 轮保存。",
+			"policy.interval.label": "间隔轮数",
+			"policy.interval.unit": "轮",
+			"policy.apply.label": "保存方式",
+			"policy.apply.draft.label": "只存草稿",
+			"policy.apply.draft.hint": "最安全：草稿不进 git 历史，等你确认后才变成提交。",
+			"policy.apply.commit.label": "直接提交",
+			"policy.apply.commit.hint": "每次保存都写成真实 git 提交，回复下方的徽章会显示它。",
+			"policy.note.draft": "草稿保存在 .dsh-checkpoint 里，不会自己进 git 历史。",
+			"policy.note.commit": "每次保存都会在这个项目里写一条 git 提交，历史会跟着对话增长。",
+			"policy.loading": "正在读取设置…",
+			"policy.unavailable": "这个 DSH 版本没有提供设置服务，自动检查点暂不可用。",
+			"policy.readonly": "这些设置被宿主配置锁定，暂时不能修改。",
+			"policy.saved": "已保存",
 		};
 		//#endregion
 
@@ -517,6 +719,195 @@ window.__ModuleLoader__.load({
 		}
 		//#endregion
 
+		//#region settings card
+		/** Row styles: dense, plain, and readable at settings-page scale. */
+		const CARD_ROW_STYLE = {
+			display: "flex",
+			alignItems: "flex-start",
+			gap: "8px",
+			padding: "6px 0",
+			cursor: "pointer",
+			border: "0",
+			background: "transparent",
+			color: "inherit",
+			textAlign: "left",
+			width: "100%",
+			font: "inherit",
+		};
+		const DOT_STYLE = {
+			flex: "0 0 auto",
+			width: "14px",
+			height: "14px",
+			marginTop: "3px",
+			borderRadius: "50%",
+			border: "1.5px solid currentColor",
+			boxSizing: "border-box",
+			opacity: "0.55",
+		};
+		const DOT_ON_STYLE = { ...DOT_STYLE, border: "4px solid currentColor", opacity: "0.9" };
+		const ROW_TEXT_STYLE = { display: "flex", flexDirection: "column", gap: "2px", minWidth: "0" };
+		const ROW_LABEL_STYLE = { fontSize: "13px", lineHeight: "18px" };
+		const ROW_HINT_STYLE = { fontSize: "11.5px", lineHeight: "16px", opacity: "0.62" };
+		const CARD_NOTE_STYLE = { fontSize: "11.5px", lineHeight: "16px", opacity: "0.62", margin: "6px 0 0" };
+		const NUMBER_STYLE = {
+			width: "56px",
+			marginLeft: "6px",
+			padding: "1px 4px",
+			borderRadius: "4px",
+			border: "1px solid currentColor",
+			background: "transparent",
+			color: "inherit",
+			font: "inherit",
+			fontSize: "12px",
+		};
+
+		/**
+		 * One radio row: a labelled choice plus a plain-language explanation.
+		 * @param key - stable React key.
+		 * @param label - what the choice does, in one phrase.
+		 * @param hint - why someone would pick it.
+		 * @param active - selected flag.
+		 * @param disabled - locked by the host.
+		 * @param onSelect - click handler.
+		 * @returns the row element.
+		 */
+		function choiceRow(key, label, hint, active, disabled, onSelect) {
+			return React.createElement(
+				"button",
+				{
+					key,
+					type: "button",
+					role: "radio",
+					"aria-checked": active ? "true" : "false",
+					"aria-label": label,
+					style: { ...CARD_ROW_STYLE, cursor: disabled ? "default" : "pointer", opacity: disabled ? "0.5" : "1" },
+					className: "dsh-agent-checkpoint-choice",
+					"data-agent-checkpoint-choice": key,
+					"data-active": active ? "true" : "false",
+					disabled,
+					onClick: onSelect,
+				},
+				React.createElement("span", { style: active ? DOT_ON_STYLE : DOT_STYLE }),
+				React.createElement(
+					"span",
+					{ style: ROW_TEXT_STYLE },
+					React.createElement("span", { style: ROW_LABEL_STYLE }, label),
+					React.createElement("span", { style: ROW_HINT_STYLE }, hint),
+				),
+			);
+		}
+
+		/**
+		 * Settings card: when should DSH save a checkpoint by itself.
+		 *
+		 * The wording is operational ("whenever files change", "after every
+		 * message") rather than architectural, because the reader is deciding how
+		 * their project gets backed up, not how the plugin is built. Writes are
+		 * immediate — there is no save button, matching the host's live scope.
+		 * @param props - `useCheckpointPolicy` hook plus the locale function `t`.
+		 * @returns the card element mounted in the settings page.
+		 */
+		function PolicyCard(props) {
+			const t = props.t;
+			const state = typeof props.useCheckpointPolicy === "function" ? props.useCheckpointPolicy() : policyStateOf(null);
+			const text = (key, fallback) => {
+				try {
+					const translated = typeof t === "function" ? t(key) : undefined;
+					return typeof translated === "string" && translated !== "" ? translated : fallback;
+				} catch {
+					return fallback;
+				}
+			};
+			const disabled = state.status !== "ready" || state.writable !== true;
+			const set = (field, value) => {
+				if (disabled) return;
+				policyStore.set(field, value);
+			};
+
+			const triggerRows = TRIGGER_IDS.map((id) =>
+				choiceRow(
+					id,
+					text(`policy.trigger.${id}.label`, id),
+					text(`policy.trigger.${id}.hint`, ""),
+					state.trigger === id,
+					disabled,
+					() => set("trigger", id),
+				),
+			);
+
+			// The interval field stays visible so the number is easy to find after
+			// switching modes; it is only editable in its own mode.
+			const intervalRow = React.createElement(
+				"div",
+				{ key: "interval", style: { ...CARD_ROW_STYLE, cursor: "default", paddingLeft: "22px" } },
+				React.createElement("span", { style: ROW_LABEL_STYLE }, text("policy.interval.label", "Number of rounds")),
+				React.createElement("input", {
+					type: "number",
+					min: String(INTERVAL_MIN),
+					max: String(INTERVAL_MAX),
+					step: "1",
+					value: String(state.interval_turns),
+					style: { ...NUMBER_STYLE, opacity: disabled || state.trigger !== "interval_turns" ? "0.45" : "0.9" },
+					disabled: disabled || state.trigger !== "interval_turns",
+					"aria-label": text("policy.interval.label", "Number of rounds"),
+					"data-agent-checkpoint-interval": String(state.interval_turns),
+					onChange: (event) => set("interval_turns", event.target.value),
+				}),
+			);
+
+			const applyRows = APPLY_IDS.map((id) =>
+				choiceRow(
+					`apply-${id}`,
+					text(`policy.apply.${id}.label`, id),
+					text(`policy.apply.${id}.hint`, ""),
+					state.apply === id,
+					disabled,
+					() => set("apply", id),
+				),
+			);
+
+			const note = state.status === "unavailable"
+				? text("policy.unavailable", "Settings are unavailable, so automatic checkpoints are off.")
+				: state.status !== "ready"
+					? text("policy.loading", "Reading settings…")
+					: state.writable !== true
+						? text("policy.readonly", "These settings are locked by the host configuration.")
+						: text(state.apply === "commit" ? "policy.note.commit" : "policy.note.draft", "");
+
+			return React.createElement(
+				"li",
+				{ className: "lc-settings-card", "data-agent-checkpoint-card": POLICY_NAMESPACE },
+				React.createElement(
+					"div",
+					{ className: "lc-settings-head" },
+					React.createElement(
+						"div",
+						{ className: "lc-settings-headtext" },
+						React.createElement("div", { className: "lc-settings-name" }, text("policy.name", "Automatic checkpoints")),
+						React.createElement("div", { className: "lc-settings-desc" }, text("policy.desc", "")),
+					),
+				),
+				React.createElement(
+					"div",
+					{ className: "lc-settings-body" },
+					React.createElement(
+						"div",
+						{ role: "radiogroup", "aria-label": text("policy.name", "Automatic checkpoints") },
+						triggerRows,
+						intervalRow,
+					),
+					React.createElement(
+						"div",
+						{ role: "radiogroup", "aria-label": text("policy.apply.label", "When saving"), style: { marginTop: "10px" } },
+						React.createElement("div", { style: { ...ROW_LABEL_STYLE, opacity: "0.75" } }, text("policy.apply.label", "When saving")),
+						applyRows,
+					),
+				),
+				React.createElement("p", { className: "lc-settings-note", style: CARD_NOTE_STYLE }, note),
+			);
+		}
+		//#endregion
+
 		//#region plugin
 		/** The slot registry and the copy service are the only dependencies. */
 		const inject = [ "slots", "locale" ];
@@ -534,6 +925,20 @@ window.__ModuleLoader__.load({
 				locale: NS,
 				inject: (sessionId) => ({ sessionId }),
 			}, CommitBadge));
+
+			// The card is only rendered when the host also serves the namespace,
+			// so a DSH build without the settings service simply shows no card.
+			if (typeof ctx.inject !== "function") return;
+			ctx.inject([ "settingsScope" ], (scoped) => {
+				const bound = scoped.settingsScope.bind({ namespace: POLICY_NAMESPACE });
+				scoped.effect(() => policyStore.attach(bound), "agent-checkpoint: settings scope");
+				scoped.slots.inject("settings.plugin.item", () => scoped.slots.register({
+					name: "settings.plugin.item",
+					key: POLICY_NAMESPACE,
+					locale: NS,
+					inject: () => ({ hooks: { checkpointPolicy: policyStore } }),
+				}, PolicyCard));
+			});
 		}
 		//#endregion
 
@@ -546,6 +951,11 @@ window.__ModuleLoader__.load({
 		exports.badgeUrl = badgeUrl;
 		exports.initUrl = initUrl;
 		exports.createStore = createStore;
+		exports.PolicyCard = PolicyCard;
+		exports.createPolicyStore = createPolicyStore;
+		exports.policyStateOf = policyStateOf;
+		exports.clampIntervalTurns = clampIntervalTurns;
+		exports.normalizePolicyValue = normalizePolicyValue;
 		return module.exports;
 	}
 });

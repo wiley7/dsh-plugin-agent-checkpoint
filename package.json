@@ -1,6 +1,6 @@
 {
   "name": "dsh-plugin-agent-checkpoint",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "Session-aware checkpoint manager for DeepSeek Harness (DSH). Pairs git file snapshots with serialized agent conversation context.",
   "type": "module",
   "main": "./dist/host.js",
@@ -46,6 +46,14 @@
   "engines": {
     "node": ">=20.0.0",
     "dsh": ">=0.2.0-rc.2"
+  },
+  "peerDependencies": {
+    "@deepseek-ai/schemastery": "^3.18.0"
+  },
+  "peerDependenciesMeta": {
+    "@deepseek-ai/schemastery": {
+      "optional": true
+    }
   },
   "dsh": {
     "bundle": {

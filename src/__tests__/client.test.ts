@@ -154,6 +154,8 @@ describe('client bundle contract', () => {
     const dictionaries: string[] = [];
     let effects = 0;
 
+    const requested: string[][] = [];
+    const bound: Array<{ namespace: string }> = [];
     const ctx = {
       locale: {
         register(namespace: string) {
@@ -169,6 +171,22 @@ describe('client bundle contract', () => {
           return options;
         },
       },
+      inject(dependencies: string[], callback: (scoped: unknown) => void) {
+        requested.push(dependencies);
+        callback({
+          ...ctx,
+          settingsScope: {
+            bind(options: { namespace: string }) {
+              bound.push(options);
+              return {
+                getSnapshot: () => ({ status: 'ready', writable: true, value: { trigger: 'off', apply: 'draft', interval_turns: 5 } }),
+                subscribe: () => () => {},
+                set: () => Promise.resolve(),
+              };
+            },
+          },
+        });
+      },
       effect(run: () => () => void) {
         effects += 1;
         return run();
@@ -176,9 +194,21 @@ describe('client bundle contract', () => {
     };
     bundle.exports.apply(ctx);
 
-    assert.equal(effects, 1);
+    assert.equal(effects, 2);
+    // The bundle runs in its own realm, so compare across realms by JSON.
+    assert.equal(JSON.stringify(requested), JSON.stringify([ [ 'settingsScope' ] ]));
+    assert.equal(JSON.stringify(bound), JSON.stringify([ { namespace: 'agent-checkpoint' } ]));
     assert.deepEqual(dictionaries, [ 'agent-checkpoint' ]);
-    assert.equal(slotCalls.length, 1);
+    assert.equal(slotCalls.length, 2);
+    const card = slotCalls[1]!;
+    assert.equal(card.name, 'settings.plugin.item');
+    assert.equal(card.entry.name, 'settings.plugin.item');
+    assert.equal(card.entry.key, 'agent-checkpoint');
+    assert.equal(card.entry.locale, 'agent-checkpoint');
+    const cardFace = (card.entry.inject as () => Record<string, unknown>)();
+    assert.deepEqual(Object.keys(cardFace), [ 'hooks' ]);
+    assert.ok((cardFace.hooks as Record<string, unknown>).checkpointPolicy);
+
     const call = slotCalls[0]!;
     assert.equal(call.name, 'conversation.chat.assistant-actions');
     assert.equal(call.entry.name, 'conversation.chat.assistant-actions');
@@ -323,5 +353,138 @@ describe('client store', () => {
     await store.refresh('session-plain');
     assert.equal(store.peek('session-plain'), null);
     assert.equal(store.error('session-plain'), 'not_a_git_repo');
+  });
+});
+
+describe('client settings card', () => {
+  /** Flatten every string rendered under an element, in document order. */
+  function collectText(node: unknown, out: string[] = []): string[] {
+    if (typeof node === 'string') {
+      out.push(node);
+      return out;
+    }
+    if (Array.isArray(node)) {
+      for (const child of node) collectText(child, out);
+      return out;
+    }
+    if (node && typeof node === 'object') {
+      const element = node as Element;
+      collectText(element.children, out);
+    }
+    return out;
+  }
+
+  /** Every element whose props carry `data-agent-checkpoint-choice`. */
+  function choices(node: unknown, out: Array<{ id: unknown; active: unknown; disabled: unknown }> = []) {
+    if (Array.isArray(node)) {
+      for (const child of node) choices(child, out);
+      return out;
+    }
+    if (node && typeof node === 'object') {
+      const element = node as Element;
+      const id = element.props['data-agent-checkpoint-choice'];
+      if (id !== undefined) out.push({ id, active: element.props['data-active'], disabled: element.props.disabled });
+      choices(element.children, out);
+    }
+    return out;
+  }
+
+  it('normalizes persisted values onto the documented contract', async () => {
+    const bundle = await loadBundle();
+    const { normalizePolicyValue, clampIntervalTurns, policyStateOf } = bundle.exports;
+    assert.equal(JSON.stringify(normalizePolicyValue(undefined)), JSON.stringify({ trigger: 'off', apply: 'draft', interval_turns: 5 }));
+    assert.equal(JSON.stringify(normalizePolicyValue({ trigger: 'turn', apply: 'commit', interval_turns: 9 })), JSON.stringify({ trigger: 'turn', apply: 'commit', interval_turns: 9 }));
+    // Unknown ids fall back per field, so one stale value cannot blank the card.
+    assert.equal(JSON.stringify(normalizePolicyValue({ trigger: 'nope', apply: 'commit', interval_turns: 3 })), JSON.stringify({ trigger: 'off', apply: 'commit', interval_turns: 3 }));
+    assert.equal(clampIntervalTurns(0), 1);
+    assert.equal(clampIntervalTurns(99), 50);
+    assert.equal(clampIntervalTurns('7'), 7);
+    assert.equal(clampIntervalTurns('abc'), null);
+    assert.equal(policyStateOf(null).status, 'loading');
+    assert.equal(policyStateOf({ status: 'ready', writable: true, value: { trigger: 'turn' } }).trigger, 'turn');
+  });
+
+  it('renders the four trigger choices and the two save modes', async () => {
+    const bundle = await loadBundle();
+    const element = bundle.exports.PolicyCard({
+      t: (key: string) => key,
+      useCheckpointPolicy: () => ({ status: 'ready', writable: true, trigger: 'file_change', apply: 'draft', interval_turns: 5 }),
+    }) as Element;
+
+    assert.equal(element.type, 'li');
+    assert.equal(element.props.className, 'lc-settings-card');
+    assert.equal(element.props['data-agent-checkpoint-card'], 'agent-checkpoint');
+
+    const rows = choices(element);
+    assert.equal(JSON.stringify(rows.map((row) => row.id)), JSON.stringify([ 'off', 'file_change', 'turn', 'interval_turns', 'apply-draft', 'apply-commit' ]));
+    assert.equal(rows.filter((row) => row.active === 'true').length, 2);
+    assert.ok(rows.every((row) => row.disabled === false));
+
+    const texts = collectText(element).join('\n');
+    assert.match(texts, /policy\.name/);
+    // Both save modes explain their consequence in the card body.
+    assert.match(texts, /policy\.apply\.commit\.hint/);
+    assert.match(texts, /policy\.note\.draft/);
+  });
+
+  it('locks the choices when the host says the namespace is read-only', async () => {
+    const bundle = await loadBundle();
+    const element = bundle.exports.PolicyCard({
+      t: (key: string) => key,
+      useCheckpointPolicy: () => ({ status: 'ready', writable: false, trigger: 'off', apply: 'draft', interval_turns: 5 }),
+    }) as Element;
+    assert.ok(choices(element).every((row) => row.disabled === true));
+    assert.match(collectText(element).join('\n'), /policy\.readonly/);
+  });
+
+  it('explains when the host has no settings service at all', async () => {
+    const bundle = await loadBundle();
+    const element = bundle.exports.PolicyCard({
+      t: (key: string) => key,
+      useCheckpointPolicy: () => ({ status: 'unavailable', writable: false, trigger: 'off', apply: 'draft', interval_turns: 5 }),
+    }) as Element;
+    assert.match(collectText(element).join('\n'), /policy\.unavailable/);
+  });
+
+  it('persists a click immediately, without a save button', async () => {
+    const bundle = await loadBundle();
+    const writes: Array<{ field: string; value: unknown }> = [];
+    let push: (() => void) | null = null;
+    // The bound scope is the source of truth: `subscribe` only signals that it changed.
+    let current: unknown = { status: 'ready', writable: true, value: { trigger: 'off', apply: 'draft', interval_turns: 5 } };
+    const store = bundle.exports.createPolicyStore();
+    const detach = store.attach({
+      getSnapshot: () => current,
+      subscribe: (listener: () => void) => {
+        push = listener;
+        return () => {
+          push = null;
+        };
+      },
+      set: (field: string, value: unknown) => {
+        writes.push({ field, value });
+        return Promise.resolve();
+      },
+    });
+
+    // The click is applied locally first: the card must react before the round trip.
+    store.set('trigger', 'turn');
+    assert.equal(store.getSnapshot().trigger, 'turn');
+    assert.equal(JSON.stringify(writes), JSON.stringify([ { field: 'trigger', value: 'turn' } ]));
+
+    // Invalid values never reach the host.
+    store.set('trigger', 'sometimes');
+    store.set('interval_turns', 'abc');
+    assert.equal(writes.length, 1);
+
+    // The host echo replaces the local guess.
+    current = { status: 'ready', writable: true, value: { trigger: 'interval_turns', apply: 'commit', interval_turns: 9 } };
+    (push as (() => void) | null)?.();
+    assert.equal(store.getSnapshot().trigger, 'interval_turns');
+    assert.equal(store.getSnapshot().apply, 'commit');
+    assert.equal(store.getSnapshot().interval_turns, 9);
+
+    detach();
+    assert.equal(push, null);
   });
 });

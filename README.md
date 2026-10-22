@@ -11,12 +11,15 @@ context that produced them.
 | **File storage** | native `git` CLI, in your own repository; the plugin invents no new file format |
 | **Context storage** | JSON sidecars under `.dsh-checkpoint/` in the workspace |
 | **Destructive operations** | always two-phase: a human-confirmed, single-use token is required |
+| **Automatic checkpoints** | optional, configured in DSH **Settings → Plugins**: off, on file change, every message, or every N messages |
 | **Network** | none. Local only, no telemetry, no push/pull/fetch |
 | **Requires** | Node.js ≥ 20, `git` ≥ 2.23 (recommended), a DSH build with `@deepseek-ai/dsh-mcp-client` |
 
 Contents: [The problem](#the-problem) · [Feature tour](#feature-tour) ·
 [How it works](#how-it-works) · [Quick start](#quick-start) ·
-[Using it in a session](#using-it-in-a-session) · [The commit badge](#the-commit-badge-in-the-web-ui) ·
+[Using it in a session](#using-it-in-a-session) ·
+[Automatic checkpoints](#automatic-checkpoints) ·
+[The commit badge](#the-commit-badge-in-the-web-ui) ·
 [Tool reference](#tool-reference) · [Configuration](#configuration) · [Storage](#storage-layout) ·
 [Safety model](#safety-model) · [Rollback](#rollback-semantics) ·
 [Context capture](#agent-context-capture) · [Errors](#error-reference) ·
@@ -102,6 +105,25 @@ is a confirmed checkpoint. In a project that is not a git repository yet, the pi
 becomes a dashed **⚙ Enable checkpoints** control that initialises the project —
 behind a second click and a server-side `confirm=1` check.
 [Details below.](#the-commit-badge-in-the-web-ui)
+
+### 7. Automatic checkpoints, on your terms
+
+The plugin can also save on its own — that is what the **Automatic checkpoints**
+card under *Settings → Plugins* configures:
+
+| Question | Choices |
+| --- | --- |
+| **When should it save?** | `Off` (only when you ask) · `Whenever files change` · `After every message` · `Every N messages` |
+| **How should it save?** | `Keep as draft` (default) · `Commit right away` |
+
+The default is *off* + *draft*, so turning the feature on can never write to your
+git history by itself. `Commit right away` is the one setting that produces real
+commits without a confirmation token — you opt into it explicitly, and the badge
+under each reply shows the result.
+
+No new HTTP route is involved: the browser card edits the `agent-checkpoint`
+settings namespace through DSH's own settings service, and the host half reacts
+to `turn/end` events. See [Automatic checkpoints](#automatic-checkpoints).
 
 ### Why not just `git stash` / `git commit` / tags?
 
@@ -291,6 +313,65 @@ message invalidates it (`confirmation_mismatch`), it expires after
 Every tool also accepts an optional absolute `workspace` argument, so one stdio
 server can snapshot, roll back and branch several projects without a restart.
 
+## Automatic checkpoints
+
+By default the plugin only saves when you ask the assistant to. If you would
+rather have it save by itself, open **Settings → Plugins → Automatic checkpoints**
+(the card appears only when the host half is loaded, because the card and the
+namespace are the two halves of the same feature).
+
+### The two questions the card asks
+
+**When should it save?**
+
+| Choice | Behaviour |
+| --- | --- |
+| `Off` (default) | nothing is created automatically; ask for a checkpoint when you want one |
+| `Whenever files change` | a snapshot after any turn that modified files; quiet turns are skipped |
+| `After every message` | a snapshot after every turn, including the conversation when no file changed |
+| `Every N messages` | a snapshot every N turns (`N` = 1–50, default 5) |
+
+**How should it save?**
+
+| Choice | Behaviour |
+| --- | --- |
+| `Keep as draft` (default) | the snapshot lands in `.dsh-checkpoint/` and never enters git history until you confirm it |
+| `Commit right away` | each snapshot becomes a real `git commit`, authored as `checkpoint: automatic save after turn N` |
+
+### What the automation will not do
+
+- **It never initialises a repository.** A session whose project is not a git
+  repository root is skipped — enabling checkpoints stays the explicit
+  **⚙ Enable checkpoints** click described below.
+- **It never uses a fallback directory.** The workspace comes from the session log
+  header (`source: "session"`); a standalone `dsh` launch directory is never
+  checkpointed by accident.
+- **It never forces a commit past a conflict.** With `Commit right away`, the same
+  guards as `confirm_checkpoint` run: if HEAD moved or the tree drifted since the
+  draft was captured, the draft is kept and the commit is skipped (logged to
+  stderr).
+- **It never saves the same turn twice**, and evaluations for one session are
+  serialised, so a slow snapshot cannot interleave with the next turn.
+
+### How the setting is stored
+
+The card edits a DSH settings section named `agent-checkpoint`:
+
+```json
+{ "trigger": "off", "apply": "draft", "interval_turns": 5 }
+```
+
+DSH persists it (`applies: "live"`, so a change takes effect on the next turn);
+the host half registers the namespace with a [schemastery](https://github.com/shigma/schemastery)
+schema, and falls back to an equivalent hand-written schema when the host does not
+expose `@deepseek-ai/schemastery` — the plugin never fails to start because of it.
+Builds without a settings service simply show no card and never save
+automatically.
+
+This is separate from `checkpoint.config.json`: that file holds per-workspace
+limits and ignore rules (see [Configuration](#configuration)); the trigger policy
+lives in DSH settings so it is editable without touching the project.
+
 ## The commit badge in the web UI
 
 ```
@@ -454,9 +535,9 @@ to the defaults; invalid values produce warnings but never abort a tool call.
 | `max_diff_chars` | `100000` | inline diff cap; longer diffs go to `.dsh-checkpoint/diffs/` |
 | `confirmation_ttl_seconds` | `600` | lifetime of a confirmation token |
 
-Trigger policy: a user command such as `/checkpoint` always wins, an agent
-marking a subtask complete comes second, and snapshotting every conversational
-turn is **off** by default.
+`auto_draft_on_milestone` is a *hint* read by `get_status`; it does not create
+anything. The behaviour that actually saves automatically lives in
+[Automatic checkpoints](#automatic-checkpoints) (DSH settings), not in this file.
 
 ## Storage layout
 
@@ -592,7 +673,7 @@ loader, the session-log reader (including zstd fixtures), the MCP transport itse
 (workspace resolution, timeline, method and loopback fences, the init guard) and
 the browser bundle (loaded in a `node:vm` sandbox with a React shim, so slot wiring,
 the display model and the init control are exercised without a DOM).
-**73 tests, no network access, no writes outside the OS temp dir.**
+**112 tests, no network access, no writes outside the OS temp dir.**
 
 ```
 src/index.ts      MCP stdio server (nine tools)
@@ -611,6 +692,8 @@ client/client.js  browser half: commit badge (no build step)
 | Destructive ops | two-phase token | same, plus approving from the badge |
 | Context rehydration | tool result digest + sidecar | survive a DSH restart by re-reading sidecars into a fresh session |
 | Badge | current `HEAD` per reply | per-reply attribution from the per-turn timeline the route already returns |
+| Auto triggers | off / file change / every turn / every N turns (settings card) | per-language rules, per-workspace overrides, "only when tests pass" |
+| Settings surface | trigger + save mode | ignore rules and draft limits editable from the same card |
 | Branching | local create/switch | store export/backup, timeline UI, cross-workspace index |
 | Out of scope | push/pull/fetch, remotes, collaboration, automatic conflict resolution, binary large-object handling, background scheduling, checkpoint deletion | — |
 
@@ -630,6 +713,10 @@ Known maintenance surfaces:
   `__ModuleLoader__` bundle shape. If DSH changes either, the badge disappears while
   the tools keep working — which is why the display model is testable independently
   of the slot wiring.
+- **Settings schema drift.** The card and the host half agree on one namespace and
+  three fields (`trigger`, `apply`, `interval_turns`). The client normalizes unknown
+  values field by field, so a newer host can add a trigger id without blanking the
+  card, but new fields need both halves updated.
 - **git version differences.** `git switch` needs 2.23+; the plugin falls back to
   `git checkout`. Nothing else requires a recent git.
 

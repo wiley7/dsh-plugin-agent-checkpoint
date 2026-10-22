@@ -746,6 +746,39 @@ export class CheckpointService {
 
     const pending = await this.#requireConfirmation(input.confirmationId, 'confirm_checkpoint', payload);
 
+    const result = await this.#commitDraft(record, commitMessage);
+    if (result.status === 'confirmed') await consumePendingConfirmation(this.#workspace, pending.id);
+    return result;
+  }
+
+  /**
+   * Commit a draft the operator already opted into from Settings.
+   *
+   * This skips the two-phase token on purpose: the operator turned commits on
+   * in the settings card, which is the approval. Everything a confirmation
+   * would protect still applies — HEAD must not have moved and the working tree
+   * must match the captured tree — and a mismatch returns a conflict report
+   * without writing history.
+   */
+  async commitDraftAutomatically(input: {
+    draftId: string;
+    commitMessage?: string;
+  }): Promise<ConfirmResult | ConflictReport> {
+    const { id, record } = await this.#requireRecord(input.draftId);
+    if (record.status !== 'draft') {
+      throw new CheckpointError('already_confirmed', `${id} is already a confirmed checkpoint (commit ${record.commitHash})`);
+    }
+    const commitMessage = (input.commitMessage ?? '').trim() || record.title || `checkpoint: ${id}`;
+    return await this.#commitDraft(record, commitMessage);
+  }
+
+  /**
+   * Shared commit pipeline: the guards both confirm paths rely on.
+   * @param record - the draft record to promote.
+   * @param commitMessage - the message for the new commit.
+   * @returns the confirmed checkpoint, or a conflict report.
+   */
+  async #commitDraft(record: CheckpointRecord, commitMessage: string): Promise<ConfirmResult | ConflictReport> {
     const repo = await this.#ensureRepo();
     if ((repo.head ?? null) !== (record.baseCommit ?? null)) {
       return {
@@ -798,7 +831,6 @@ export class CheckpointService {
     await g.updateRef(this.#workspace, confirmed.anchorRef, commitHash);
     await g.deleteRef(this.#workspace, record.anchorRef).catch(() => undefined);
     await writeAlias(this.#workspace, record.id, confirmedId);
-    await consumePendingConfirmation(this.#workspace, pending.id);
 
     return {
       status: 'confirmed',

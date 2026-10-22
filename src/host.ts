@@ -16,9 +16,17 @@ import type { IncomingMessage, ServerResponse } from 'node:http';
 import { realpath } from 'node:fs/promises';
 import { isAbsolute, resolve as resolvePath } from 'node:path';
 import { CheckpointError, CheckpointService } from './checkpoint.js';
-import { currentBranch, git, headHash, isDirty, isInsideWorkTree } from './git.js';
+import { currentBranch, git, headHash, isDirty, isInsideWorkTree, topLevel } from './git.js';
+import {
+  createPolicyState,
+  installPolicySettings,
+  POLICY_NAMESPACE,
+  type PolicyState,
+  type SettingsServiceLike,
+} from './policy.js';
 import { discoverSessionLog, readSessionHeader, resolveDshHome } from './session.js';
 import { listRecords } from './store.js';
+import { createTriggerEngine, type TriggerCheckpointRequest, type TriggerEngine } from './trigger.js';
 import type { CheckpointRecord } from './types.js';
 
 /** Cordis plugin name; must match the package name used by the bundle patch. */
@@ -96,6 +104,10 @@ export interface WebServerLike {
 export interface PluginContextLike {
   webServer: WebServerLike;
   effect?: (run: () => (() => void) | void, label?: string) => unknown;
+  /** Session event bus (`session/event`); absent in tests and older hosts. */
+  on?: (event: 'session/event', listener: (session: { id: string }, event: { type: string; data?: unknown }) => void) => unknown;
+  /** Optional-service injection used to reach `ctx.settings`. */
+  inject?: (dependencies: string[], callback: (scoped: { settings?: SettingsServiceLike }) => void) => unknown;
 }
 
 /** Inputs that decide which workspace gets reported. */
@@ -509,6 +521,99 @@ export async function handleInitRequest(
 }
 
 /**
+ * Commit message for a checkpoint the plugin created on its own.
+ * @param request - what the trigger engine asked for.
+ * @returns a one-line conventional message.
+ */
+export function automaticCommitMessage(request: TriggerCheckpointRequest): string {
+  return request.turn === null ? 'checkpoint: automatic save' : `checkpoint: automatic save after turn ${request.turn}`;
+}
+
+/** Options for {@link createAutomaticCheckpoints}. */
+export interface AutomaticCheckpointOptions {
+  /** Plugin configuration (workspace fallbacks and session discovery). */
+  config: AgentCheckpointHostConfig;
+  /** stderr sink. */
+  log?: (message: string) => void;
+  /** Sharing the policy state with a caller that already built one. */
+  policy?: PolicyState;
+}
+
+/** What {@link createAutomaticCheckpoints} hands back to `apply`. */
+export interface AutomaticCheckpoints {
+  engine: TriggerEngine;
+  policy: PolicyState;
+}
+
+/**
+ * Wire the automatic-checkpoint trigger to git and the snapshot store.
+ *
+ * Safety rules implemented here, on top of the engine's own decisions:
+ * - the workspace comes from the session log only (`source: 'session'`), never
+ *   from the configured fallback, so a launch directory cannot be checkpointed;
+ * - a session whose workspace is not the root of a repository is skipped rather
+ *   than initialised — enabling checkpoints stays a click in the UI;
+ * - `apply: 'commit'` still runs the confirm guards (HEAD and tree drift), and a
+ *   conflict leaves the draft pending instead of forcing a commit.
+ * @param options - configuration, logging, optional shared policy state.
+ * @returns the engine plus the policy state it reads.
+ */
+export function createAutomaticCheckpoints(options: AutomaticCheckpointOptions): AutomaticCheckpoints {
+  const log = options.log ?? ((message: string) => process.stderr.write(`dsh-agent-checkpoint: ${message}\n`));
+  const policy = options.policy ?? createPolicyState();
+  /** Resolved workspace per session: session logs are read once per process. */
+  const workspaces = new Map<string, string | null>();
+  /** One service per project, mirroring the MCP half. */
+  const services = new Map<string, CheckpointService>();
+  const serviceFor = (workspace: string): CheckpointService => {
+    const existing = services.get(workspace);
+    if (existing !== undefined) return existing;
+    const created = new CheckpointService(workspace);
+    services.set(workspace, created);
+    return created;
+  };
+
+  const engine = createTriggerEngine({
+    policy: () => policy.get(),
+    workspaceFor: async (sessionId: string) => {
+      if (!workspaces.has(sessionId)) {
+        const resolution = await resolveWorkspace({ sessionId, config: options.config }).catch(() => null);
+        workspaces.set(sessionId, resolution !== null && resolution.source === 'session' ? resolution.workspace : null);
+      }
+      return workspaces.get(sessionId) ?? null;
+    },
+    isRepository: async (workspace: string) => {
+      const root = await topLevel(workspace);
+      return root !== null && resolvePath(root) === resolvePath(workspace);
+    },
+    isDirty: (workspace: string) => isDirty(workspace),
+    takeCheckpoint: async (request: TriggerCheckpointRequest) => {
+      const service = serviceFor(request.workspace);
+      const draft = await service.createDraft({
+        title: request.title,
+        tags: request.tags,
+        remark: request.remark,
+        sessionId: request.sessionId,
+      });
+      if (request.apply !== 'commit') return { checkpointId: draft.draftId, status: 'draft' as const };
+      const committed = await service.commitDraftAutomatically({
+        draftId: draft.draftId,
+        commitMessage: automaticCommitMessage(request),
+      });
+      if (committed.status !== 'confirmed') {
+        // A drifting HEAD or work tree is a conflict, not a reason to force a
+        // commit: keep the draft and let the operator confirm it later.
+        log(`automatic checkpoints: kept draft ${draft.draftId} uncommitted (${committed.reason})`);
+        return { checkpointId: draft.draftId, status: 'draft' as const };
+      }
+      return { checkpointId: committed.checkpointId, status: 'confirmed' as const };
+    },
+    log,
+  });
+  return { engine, policy };
+}
+
+/**
  * Cordis plugin body: register the badge route.
  *
  * `ctx.effect` owns the disposer when it exists (the real host), and a bare
@@ -535,4 +640,20 @@ export function apply(ctx: PluginContextLike, rawConfig: unknown = {}): void {
   };
   if (typeof ctx.effect === 'function') ctx.effect(register, 'agent-checkpoint: git badge routes');
   else register();
+
+  // Automatic checkpoints: the settings namespace is what the browser card
+  // edits, and the engine is what acts on it. Both degrade to a no-op on a host
+  // without `settings` / `session/event`, which is how the plugin behaved before
+  // the feature existed.
+  const { engine, policy } = createAutomaticCheckpoints({ config });
+  const startAutomation = () => {
+    installPolicySettings(ctx, policy);
+    const on = ctx.on;
+    if (typeof on === 'function') engine.observe({ on: (event, listener) => on.call(ctx, event, listener) });
+    return () => {
+      engine.reset();
+    };
+  };
+  if (typeof ctx.effect === 'function') ctx.effect(startAutomation, `agent-checkpoint: automatic checkpoints (${POLICY_NAMESPACE})`);
+  else startAutomation();
 }
